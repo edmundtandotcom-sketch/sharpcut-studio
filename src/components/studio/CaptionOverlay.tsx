@@ -4,7 +4,6 @@ import type { CaptionStyle } from '../../types';
 import {
   applyCase,
   getCaptionRenderSpec,
-  wrapWords,
   type CaptionRenderSpec,
 } from '../../lib/captionLayout';
 import {
@@ -183,22 +182,23 @@ export function CaptionOverlay({
         </div>
       );
     } else {
-      const lines = wrapWords(cue.words.map((w, i) => ({ w, i })), spec.wordsPerLine);
+      // Captions are ALWAYS a single line — the cue word count is already
+      // chosen (lib/captionTiming) to fit the frame width at the current size,
+      // so we render one non-wrapping row (SPEC "Caption size": single line,
+      // fewer words at larger sizes; never shrink letters independently).
       body = (
         <div key={cue.id} style={{ ...blockStyle, animation: animationCss(spec) }}>
-          {lines.map((line, li) => (
-            <div
-              key={li}
-              style={{
-                display: 'flex',
-                flexWrap: 'wrap',
-                justifyContent: isLeft ? 'flex-start' : 'center',
-                gap: `${Math.round(spec.fontSizePx * 0.28)}px`,
-              }}
-            >
-              {line.map(({ w, i }) => renderWord(w, i))}
-            </div>
-          ))}
+          <div
+            style={{
+              display: 'flex',
+              flexWrap: 'nowrap',
+              whiteSpace: 'nowrap',
+              justifyContent: isLeft ? 'flex-start' : 'center',
+              gap: `${Math.round(spec.fontSizePx * 0.28)}px`,
+            }}
+          >
+            {cue.words.map((w, i) => renderWord(w, i))}
+          </div>
         </div>
       );
     }

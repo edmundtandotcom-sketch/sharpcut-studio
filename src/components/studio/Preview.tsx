@@ -58,6 +58,15 @@ export function Preview({
   const cropEnabled = formatCrops(format, meta);
   const { outputTime } = controller;
 
+  // Size the preview box to the largest frame that fits BOTH the column width
+  // and a sensible viewport-height cap, preserving the target aspect. Width is
+  // the smaller of the full column width and the width implied by the height cap
+  // (aspect * cap); height then derives from the aspect ratio. This keeps a
+  // vertical 9:16 frame as a centred tall box instead of collapsing when a
+  // full-width box would demand a height far taller than the cap (Issue 1).
+  const MAX_PREVIEW_VH = 70;
+  const boxWidth = `min(100%, ${(MAX_PREVIEW_VH * aspect).toFixed(3)}vh)`;
+
   const zoomScale = zoomScaleAt(zooms, segments, speed, outputTime);
   const trans = transitionVisualAt(transitions, segments, speed, outputTime);
 
@@ -123,8 +132,8 @@ export function Preview({
   return (
     <div
       ref={containerRef}
-      className="relative mx-auto w-full max-w-full select-none overflow-hidden rounded-xl bg-black shadow-sm"
-      style={{ aspectRatio: String(aspect), maxHeight: '58vh' }}
+      className="relative mx-auto select-none overflow-hidden rounded-xl bg-black shadow-sm"
+      style={{ aspectRatio: String(aspect), width: boxWidth, maxHeight: `${MAX_PREVIEW_VH}vh` }}
       onPointerDown={beginCropDrag}
       onPointerMove={onPointerMove}
       onPointerUp={endDrag}

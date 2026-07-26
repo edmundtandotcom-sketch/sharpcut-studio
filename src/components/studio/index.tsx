@@ -3,6 +3,7 @@ import { ArrowLeft, Wand2 } from 'lucide-react';
 import { useAppStore } from '../../store/useAppStore';
 import { keptSegments } from '../../lib/cuts';
 import { buildCaptionCues } from '../../lib/captionTiming';
+import { formatAspect } from './studioUtils';
 import { PreviewColumn } from './PreviewColumn';
 import { ModeSection } from './ModeSection';
 import { FormatSection } from './FormatSection';
@@ -35,9 +36,14 @@ export function StudioScreen() {
 
   const duration = meta?.duration ?? 0;
   const segments = useMemo(() => keptSegments(cuts, duration), [cuts, duration]);
+  const frameAspect = useMemo(() => formatAspect(format, meta), [format, meta]);
   const cues = useMemo(
-    () => buildCaptionCues(captionBlocks, segments, speed),
-    [captionBlocks, segments, speed],
+    () =>
+      buildCaptionCues(captionBlocks, segments, speed, {
+        sizePct: caption.sizePct,
+        frameAspect,
+      }),
+    [captionBlocks, segments, speed, caption.sizePct, frameAspect],
   );
 
   const controller = usePreviewController(segments, speed);

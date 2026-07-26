@@ -479,6 +479,58 @@ export function wordsPerLine(sizePct: number): number {
   return 5;
 }
 
+// ---------------------------------------------------------------------------
+// Single-line words-per-cue sizing model (SPEC "Caption size").
+//
+// Captions are ALWAYS a single line. Instead of shrinking letters or wrapping,
+// we show FEWER words per cue as the size slider grows so the one line fits the
+// video width with safe margins. The count is derived from a character-width
+// heuristic (not bare magic numbers), so preview and export agree:
+//
+//   fontPx        = CAPTION_BASE_FRACTION * (sizePct/100) * frameHeight
+//   usableWidthPx = (1 - 2*CAPTION_SAFE_X) * frameWidth
+//   wordWidthPx   = AVG_WORD_CHARS * AVG_ADVANCE_EM * fontPx
+//   maxWords      = usableWidthPx / wordWidthPx
+//                 = K * frameAspect * (100/sizePct)   with  frameAspect = W/H
+//
+// frameAspect defaults to a moderate reference (leaning narrow) so a single
+// line still fits typical vertical frames; callers that know the real output
+// aspect (studio preview, export plan) pass it for exact per-format fitting.
+// ---------------------------------------------------------------------------
+
+/** Caption cap-height as a fraction of frame height at 100% (matches overlay + ASS). */
+export const CAPTION_BASE_FRACTION = 0.055;
+/** Safe horizontal margin each side, as a fraction of frame width (matches ASS SAFE_X). */
+export const CAPTION_SAFE_X = 0.06;
+/** Representative characters per word including a trailing space. */
+const AVG_WORD_CHARS = 6;
+/** Average glyph advance as a fraction of the font size (bold/wide caption faces). */
+const AVG_ADVANCE_EM = 0.55;
+/** Reference frame aspect (W/H) used when the caller does not supply one. */
+export const DEFAULT_CAPTION_FRAME_ASPECT = 1.2;
+/** Never show more than this many words on a single caption line. */
+const MAX_WORDS_PER_CUE = 6;
+
+/**
+ * Words to show on a single caption line for a given size percentage and frame
+ * aspect (width / height). Larger sizes -> fewer words; narrower frames (e.g.
+ * 9:16) -> fewer words. Clamped to [1, MAX_WORDS_PER_CUE].
+ */
+export function wordsPerCueForSize(
+  sizePct: number,
+  frameAspect: number = DEFAULT_CAPTION_FRAME_ASPECT,
+): number {
+  const size = Number.isFinite(sizePct) && sizePct > 0 ? sizePct : 100;
+  const aspect = Number.isFinite(frameAspect) && frameAspect > 0 ? frameAspect : DEFAULT_CAPTION_FRAME_ASPECT;
+  const usableFracW = 1 - 2 * CAPTION_SAFE_X; // fraction of width available for text
+  const wordWidthEm = AVG_WORD_CHARS * AVG_ADVANCE_EM; // word width in font-size units
+  // maxWords = usableWidthPx / wordWidthPx, with fontPx = BASE_FRACTION*(size/100)*H
+  // and usableWidthPx = usableFracW * aspect * H  ->  H cancels.
+  const maxWords =
+    (usableFracW * aspect) / (wordWidthEm * CAPTION_BASE_FRACTION * (size / 100));
+  return Math.max(1, Math.min(MAX_WORDS_PER_CUE, Math.round(maxWords)));
+}
+
 /** Group a word list into balanced lines of at most `perLine` words. */
 export function wrapWords<T>(words: T[], perLine: number): T[][] {
   if (perLine < 1) perLine = 1;
