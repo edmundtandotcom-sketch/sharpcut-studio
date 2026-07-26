@@ -12,6 +12,7 @@ import type { DragEvent } from 'react';
 import { useAppStore } from '../../store/useAppStore';
 import type { PacingPreset } from '../../types';
 import { ACCEPT_ATTR, validateVideoFile } from './validation';
+import { ProjectRecoveryPanel } from './ProjectRecoveryPanel';
 
 type Phase = 'idle' | 'checking' | 'error';
 
@@ -47,6 +48,7 @@ export function UploadScreen() {
   const [phase, setPhase] = useState<Phase>('idle');
   const [errorMsg, setErrorMsg] = useState<{ error: string; recovery: string } | null>(null);
   const [dragActive, setDragActive] = useState(false);
+  const [recovering, setRecovering] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const handleFile = useCallback(
@@ -120,8 +122,13 @@ export function UploadScreen() {
         </p>
       </div>
 
+      {/* Project recovery: resume an autosaved project, or open a saved .json */}
+      <div className="mt-8">
+        <ProjectRecoveryPanel onModeChange={setRecovering} />
+      </div>
+
       {/* Drop zone */}
-      <div className="mt-10">
+      <div className={recovering ? 'hidden' : 'mt-10'}>
         <div
           onDrop={onDrop}
           onDragOver={onDragOver}
@@ -206,7 +213,7 @@ export function UploadScreen() {
       </div>
 
       {/* Pacing preset */}
-      <div className="mt-12">
+      <div className={recovering ? 'hidden' : 'mt-12'}>
         <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">
           Pacing preset
         </h2>

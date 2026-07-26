@@ -67,6 +67,37 @@ export interface ExportProgress {
   elapsedS: number;
 }
 
+// ============================================================================
+// P6 — Local Project Recovery (SPEC "LOCAL PROJECT RECOVERY")
+// ============================================================================
+
+/** Enough about the original file to detect a matching reselected file.
+ * Never includes file bytes — the browser cannot durably store the video
+ * itself, so recovery always requires the user to reselect it. */
+export interface ProjectFileFingerprint {
+  fileName: string;
+  size: number;
+  duration: number; // seconds, source
+}
+
+/** Full recoverable project state — written to IndexedDB (autosave) and to a
+ * downloadable `sharpcut-project.json` (manual save). Never contains the
+ * video file/blob itself. */
+export interface ProjectSnapshotV1 {
+  v: 1;
+  savedAt: number; // epoch ms
+  fingerprint: ProjectFileFingerprint;
+  projectMeta: ProjectMeta;
+  pacing: PacingPreset;
+  words: WordStamp[];
+  captionBlocks: CaptionBlock[];
+  cuts: Cut[];
+  studio: StudioSettings;
+  /** Stage the user was on when this was saved — resume lands here (or the
+   * closest sensible stage) once the video is reselected. */
+  appState: AppState;
+}
+
 export const DEFAULT_STUDIO_SETTINGS: StudioSettings = {
   mode: 'combined',
   selectedClipIndices: [],

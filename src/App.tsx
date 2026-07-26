@@ -3,6 +3,8 @@ import { AlertTriangle } from 'lucide-react';
 import { useAppStore } from './store/useAppStore';
 import { checkFeatures } from './lib/featureCheck';
 import { Header } from './components/shared/Header';
+import { ErrorBoundary } from './components/shared/ErrorBoundary';
+import { PersistenceController } from './components/shared/PersistenceController';
 import { UploadScreen } from './components/upload';
 import { AnalysisScreen } from './components/analysis';
 import { ReviewScreen } from './components/review';
@@ -32,19 +34,34 @@ function App() {
 
   return (
     <div className="min-h-screen bg-bg">
+      {/* Accessibility: keyboard users can jump straight past the header. */}
+      <a
+        href="#main-content"
+        className="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus:z-50 focus:rounded-lg focus:bg-primary focus:px-4 focus:py-2 focus:text-sm focus:font-semibold focus:text-white"
+      >
+        Skip to content
+      </a>
+
       <Header />
       {!features.supported && <UnsupportedBrowserBanner reasons={features.reasons} />}
 
-      <main>
-        {appState === 'upload' && <UploadScreen />}
-        {appState === 'analysis' && <AnalysisScreen />}
-        {appState === 'review' && <ReviewScreen />}
-        {appState === 'studio' && <StudioScreen />}
-        {appState === 'complete' && <ExportScreen />}
-      </main>
+      {/* Error boundary sits below Header so the wordmark, trust badge, and
+       * Save-project control stay visible and usable even if a screen crashes. */}
+      <ErrorBoundary>
+        <main id="main-content">
+          {appState === 'upload' && <UploadScreen />}
+          {appState === 'analysis' && <AnalysisScreen />}
+          {appState === 'review' && <ReviewScreen />}
+          {appState === 'studio' && <StudioScreen />}
+          {appState === 'complete' && <ExportScreen />}
+        </main>
 
-      {/* Drives the FFmpeg export engine + renders the export overlay over any state. */}
-      <ExportController />
+        {/* Drives the FFmpeg export engine + renders the export overlay over any state. */}
+        <ExportController />
+      </ErrorBoundary>
+
+      {/* Autosaves the full project snapshot (SPEC "LOCAL PROJECT RECOVERY"). */}
+      <PersistenceController />
     </div>
   );
 }

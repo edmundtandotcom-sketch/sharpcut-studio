@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { id as makeId } from '../lib/time';
 import { retokenizeBlock } from '../lib/captionTiming';
+import { clearProjectSnapshot } from '../lib/persist';
 import {
   DEFAULT_STUDIO_SETTINGS,
   type AnalysisProgress,
@@ -14,6 +15,7 @@ import {
   type OutputFormat,
   type PacingPreset,
   type ProjectMeta,
+  type ProjectSnapshotV1,
   type Quality,
   type StudioSettings,
   type TransitionPoint,
@@ -107,6 +109,16 @@ export interface AppStore {
   /** P4->P5 export seam. Studio Export button calls this; P5 engine reacts. */
   requestExport: () => void;
   clearExportRequest: () => void;
+
+  /** P6 project recovery: apply a validated snapshot together with a freshly
+   * reselected video file/URL/meta in one update, then land on 'review' or
+   * 'studio' depending on where the snapshot was saved from. */
+  restoreFromSnapshot: (args: {
+    snapshot: ProjectSnapshotV1;
+    file: File;
+    videoUrl: string;
+    meta: ProjectMeta;
+  }) => void;
 
   resetProject: () => void;
 }
@@ -304,11 +316,38 @@ export const useAppStore = create<AppStore>((set, get) => ({
   clearExportRequest: () =>
     set((s) => ({ exportJob: { ...s.exportJob, requested: false } })),
 
+  restoreFromSnapshot: ({ snapshot, file, videoUrl, meta }) => {
+    const prev = get();
+    if (prev.project.videoUrl) URL.revokeObjectURL(prev.project.videoUrl);
+    for (const r of prev.exportJob.resultUrls) URL.revokeObjectURL(r.url);
+    manualCutOrder = snapshot.cuts.filter((c) => c.type === 'manual').map((c) => c.id);
+    // Only 'review' and 'studio' are meaningful resume targets — anything else
+    // (an interrupted upload/analysis, or a completed export whose result
+    // blobs are gone) safely falls back to 'review'.
+    const resumeState: AppState = snapshot.appState === 'studio' ? 'studio' : 'review';
+
+    set((s) => ({
+      appState: resumeState,
+      project: { file, videoUrl, meta, pacing: snapshot.pacing },
+      analysis: {
+        progress: null,
+        words: snapshot.words,
+        captionBlocks: snapshot.captionBlocks,
+        error: null,
+      },
+      edits: { ...s.edits, cuts: snapshot.cuts },
+      studio: { ...s.studio, ...snapshot.studio },
+      captionEditor: initialCaptionEditor,
+      exportJob: initialExportJob,
+    }));
+  },
+
   resetProject: () => {
     const { project, exportJob } = get();
     if (project.videoUrl) URL.revokeObjectURL(project.videoUrl);
     for (const result of exportJob.resultUrls) URL.revokeObjectURL(result.url);
     manualCutOrder = [];
+    void clearProjectSnapshot(); // best-effort; "Start over" clears saved recovery data too
 
     set((s) => ({
       appState: 'upload',
@@ -321,3 +360,40 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }));
   },
 }));
+
+/**
+ * Build a P6 project snapshot from the current store state — used by both the
+ * debounced IndexedDB autosave and the manual "Save project file" download.
+ * Returns null when there's nothing worth saving yet (no project loaded, or
+ * analysis hasn't produced anything to recover).
+ */
+export function buildProjectSnapshot(state: AppStore): ProjectSnapshotV1 | null {
+  const { project, analysis, edits, studio } = state;
+  if (!project.meta || !project.file) return null;
+  return {
+    v: 1,
+    savedAt: Date.now(),
+    fingerprint: {
+      fileName: project.meta.fileName,
+      size: project.file.size,
+      duration: project.meta.duration,
+    },
+    projectMeta: project.meta,
+    pacing: project.pacing,
+    words: analysis.words,
+    captionBlocks: analysis.captionBlocks,
+    cuts: edits.cuts,
+    studio: {
+      mode: studio.mode,
+      selectedClipIndices: studio.selectedClipIndices,
+      format: studio.format,
+      speed: studio.speed,
+      caption: studio.caption,
+      transitions: studio.transitions,
+      zooms: studio.zooms,
+      crop: studio.crop,
+      quality: studio.quality,
+    },
+    appState: state.appState,
+  };
+}

@@ -46,3 +46,20 @@
     scrollbar-gutter: stable;
   }
 }
+
+/* Accessibility: SPEC "Prefers-reduced-motion: disable zoom/transition preview
+ * animations." Covers both CSS transitions/keyframes and inline style
+ * transition/animation shorthands (an !important author rule beats a
+ * non-important inline declaration on the same longhand) — so the Export
+ * Studio preview's zoom-scale transition and caption entrance keyframes snap
+ * instead of animating, with no per-component logic needed. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

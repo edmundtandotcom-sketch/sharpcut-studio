@@ -32,7 +32,7 @@ export class ErrorBoundary extends Component<Props, State> {
     if (!this.state.error) return this.props.children;
 
     return (
-      <div className="min-h-screen flex items-center justify-center bg-bg px-4">
+      <div className="flex min-h-[70vh] items-center justify-center bg-bg px-4">
         <div className="w-full max-w-md rounded-2xl border border-border bg-surface p-8 text-center shadow-sm">
           <h1 className="text-xl font-extrabold text-ink">Something went wrong</h1>
           <p className="mt-2 text-sm text-muted">
