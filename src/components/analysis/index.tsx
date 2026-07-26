@@ -7,8 +7,12 @@ import { runAnalysis, STAGE_LABELS } from '../../lib/pipeline';
 function friendlyError(err: unknown): string {
   const message = err instanceof Error ? err.message : String(err ?? '');
   const name = err instanceof Error ? err.name : '';
-  if (name === 'NoAudioError' || /no audio/i.test(message)) {
+  if (name === 'NoAudioError' || message === 'no-audio' || /no audio/i.test(message)) {
     return 'We couldn’t find an audio track to analyse. Please upload a video that contains speech.';
+  }
+  if (name === 'DecodeError') {
+    // Already an honest, user-facing sentence — surface it verbatim.
+    return message;
   }
   if (/memory|allocation|out of|quota/i.test(message)) {
     return 'Your browser ran out of memory while analysing this video. Try closing other tabs, or use a shorter clip.';
@@ -233,8 +237,9 @@ export function AnalysisScreen() {
 
             {/* Model-download notice */}
             <p className="mt-8 rounded-lg bg-bg px-4 py-3 text-xs leading-relaxed text-muted">
-              The first run downloads a private speech model to your browser (about 40&ndash;80 MB).
-              It&rsquo;s cached, so later videos start faster.
+              The first run downloads a private speech model to your browser &mdash; about 280 MB
+              with GPU acceleration, or around 75 MB on devices without it. It&rsquo;s a one-time
+              download and then cached, so later videos start faster.
             </p>
 
             <div className="mt-6 flex justify-center">

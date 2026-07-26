@@ -13,11 +13,26 @@ export interface DecodedAudio {
   duration: number; // seconds
 }
 
-/** Thrown when the file has no decodable audio track. */
+/** Thrown when the file genuinely has no audio track. */
 export class NoAudioError extends Error {
   constructor(message = 'This video has no audio track to analyse.') {
     super(message);
     this.name = 'NoAudioError';
+  }
+}
+
+/**
+ * Thrown when audio IS present but in-browser decoding failed (e.g. the file is
+ * too large for a single decodeAudioData call, or the container/codec tripped
+ * the decoder). Distinct from NoAudioError so the UI never misreports a
+ * resource failure as "no audio track".
+ */
+export class DecodeError extends Error {
+  constructor(
+    message = "We couldn't decode this video's audio — the file may be too large for in-browser decoding; try a shorter export or re-encode.",
+  ) {
+    super(message);
+    this.name = 'DecodeError';
   }
 }
 
@@ -55,7 +70,9 @@ export async function decodeAudioToPcm(
     decoded = await decodeCtx.decodeAudioData(arrayBuffer);
   } catch {
     await decodeCtx.close().catch(() => {});
-    throw new NoAudioError();
+    // Audio presence was already confirmed at upload validation, so a decode
+    // exception here is a resource/codec failure — NOT a missing audio track.
+    throw new DecodeError();
   } finally {
     arrayBuffer = null; // release the source buffer
   }

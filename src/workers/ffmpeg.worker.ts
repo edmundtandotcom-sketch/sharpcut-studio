@@ -30,13 +30,23 @@ interface WorkerScope {
 }
 const ctx = self as unknown as WorkerScope;
 
-interface RunMessage {
+interface ExportRunMessage {
   id: string;
   kind: 'run';
   type: 'export-combined' | 'export-clips';
   payload: { plan: ExportPlan; file: File };
 }
+interface ExtractAudioRunMessage {
+  id: string;
+  kind: 'run';
+  type: 'extract-audio';
+  payload: { file: File; chunkS: number; overlapS: number; duration: number };
+}
+type RunMessage = ExportRunMessage | ExtractAudioRunMessage;
 type Incoming = RunMessage | { kind: 'cancel' } | { kind?: string };
+
+// 16kHz mono is the transcription/silence sample rate (matches audioDecode.ts).
+const AUDIO_SAMPLE_RATE = 16000;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let ffmpeg: any = null;
@@ -444,14 +454,109 @@ async function cleanup(): Promise<void> {
   fsFiles.clear();
 }
 
-/** One full job attempt: (re)load ffmpeg, then run the plan from scratch. */
+// ---- Chunked audio extraction (analysis stage 1 for large/long videos) -----
+
+/**
+ * Probe the input for an audio stream. `-i input` with no output makes ffmpeg
+ * exit non-zero, but it first logs the stream table to the log ring buffer.
+ * We scan that tail for an "Audio" stream line. Returns true if one is found.
+ */
+async function probeHasAudioStream(): Promise<boolean> {
+  logTail.length = 0;
+  try {
+    // Non-zero exit is expected (no output file); we only care about the log.
+    // Force info-level logging so the input stream table is actually emitted
+    // (some core builds default to a quieter level that hides it).
+    await execWithWatchdog(['-hide_banner', '-loglevel', 'info', '-i', 'input']);
+  } catch (err) {
+    if (err instanceof HangError) throw err;
+    // Any other rejection: fall through and inspect whatever was logged.
+  }
+  const streamLines = logTail.filter((l) => /Stream #/i.test(l));
+  const hasAudio = streamLines.some((l) => /Audio/i.test(l));
+  const hasVideo = streamLines.some((l) => /Video/i.test(l));
+  // Only assert "no audio" when the probe positively saw stream lines with a
+  // video stream but no audio stream. If the log was inconclusive (no stream
+  // lines parsed at all — e.g. a log-format quirk), don't block: let the
+  // extraction proceed and surface a real failure if one actually occurs.
+  if (streamLines.length > 0 && hasVideo && !hasAudio) return false;
+  return true;
+}
+
+/**
+ * Extract the audio track as 16kHz mono f32le, one bounded chunk at a time.
+ * Each chunk window is [i*(chunkS-overlapS), +chunkS]; overlaps let the caller
+ * dedupe transcription drift. One chunk's PCM is in flight at a time (readFile
+ * then delete), so worker-side memory stays bounded regardless of file length.
+ */
+async function runExtractAudio(id: string, payload: ExtractAudioRunMessage['payload']): Promise<void> {
+  const { file, chunkS, overlapS, duration } = payload;
+  curLabel = usingThreads ? 'Extracting audio' : 'Extracting audio — single-thread mode (slower)';
+  emit(0);
+  await writeInput(file);
+
+  if (!(await probeHasAudioStream())) {
+    // Typed signal so the UI can honestly say "no audio track" (not a failure).
+    post({ id, kind: 'error', message: 'no-audio' });
+    return;
+  }
+
+  const step = Math.max(1, chunkS - overlapS);
+  const total = Math.max(1, Math.ceil(duration / step));
+  for (let i = 0; i < total; i++) {
+    throwIfCancelled();
+    const start = i * step;
+    if (start >= duration) break;
+    // Let the ffmpeg progress handler interpolate the bar within this chunk.
+    curBase = i / total;
+    curSpan = 1 / total;
+    logTail.length = 0;
+    const outName = 'chunk.raw';
+    fsFiles.add(outName);
+    const ret = await execWithWatchdog([
+      '-ss', String(r(start)),
+      '-i', 'input',
+      '-t', String(r(chunkS)),
+      '-vn', '-ac', '1', '-ar', String(AUDIO_SAMPLE_RATE),
+      '-f', 'f32le', outName,
+    ]);
+    throwIfCancelled();
+    if (typeof ret === 'number' && ret !== 0) {
+      const tail = logTail.slice(-12).join('\n');
+      throw new Error(`FFmpeg audio extraction failed (chunk ${i + 1}/${total}), code ${ret}\n${tail}`);
+    }
+    const data = (await ffmpeg.readFile(outName)) as Uint8Array;
+    // Detach from the FS buffer into a fresh, 4-byte-aligned ArrayBuffer so the
+    // Float32Array view is valid and its buffer is transferable.
+    const bytes = new Uint8Array(data);
+    await safeDelete(outName);
+    const usable = bytes.byteLength - (bytes.byteLength % 4);
+    const pcm = new Float32Array(bytes.buffer, 0, usable / 4);
+    post(
+      {
+        id,
+        kind: 'progress',
+        stage: 'extract',
+        pct: Math.round(((i + 1) / total) * 100),
+        data: { chunkIndex: i, start, total, pcm },
+      },
+      [pcm.buffer],
+    );
+  }
+
+  post({ id, kind: 'result', payload: { chunkCount: total } });
+}
+
+/** One full job attempt: (re)load ffmpeg, then run the job from scratch. */
 async function attemptJob(msg: RunMessage): Promise<void> {
   await ensureLoaded();
   throwIfCancelled();
-  if (msg.type === 'export-combined') {
-    await runCombined(msg.id, msg.payload.plan as CombinedPlan, msg.payload.file);
-  } else {
+  if (msg.type === 'extract-audio') {
+    await runExtractAudio(msg.id, msg.payload);
+  } else if (msg.type === 'export-clips') {
     await runClips(msg.id, msg.payload.plan as ClipsPlan, msg.payload.file);
+  } else {
+    await runCombined(msg.id, msg.payload.plan as CombinedPlan, msg.payload.file);
   }
 }
 

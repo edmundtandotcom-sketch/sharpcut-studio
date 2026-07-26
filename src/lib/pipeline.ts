@@ -14,7 +14,13 @@ import type {
   WordStamp,
 } from '../types';
 import { runJob } from '../workers/workerClient';
-import { chunkPcm, decodeAudioToPcm } from './audioDecode';
+import {
+  NoAudioError,
+  TARGET_SAMPLE_RATE,
+  chunkPcm,
+  decodeAudioToPcm,
+  type PcmChunk,
+} from './audioDecode';
 import { fingerprintKey, loadCheckpoint, saveChunk, saveStage } from './persist';
 import {
   PACING_DEFAULTS,
@@ -24,7 +30,16 @@ import {
   mergeChunkWords,
 } from './suggest';
 
+const CHUNK_LEN_S = 110;
 const CHUNK_OVERLAP_S = 2;
+
+// Fast path (main-thread decodeAudioData) is only safe for smaller/shorter
+// files — decodeAudioData loads the whole file into one ArrayBuffer and Chrome
+// fails the decode on very large inputs. Above either bound we switch to the
+// bounded-chunk FFmpeg extraction path (SPEC: >20-minute videos must use
+// bounded-chunk audio analysis).
+const SMALL_MAX_BYTES = 100 * 1024 * 1024; // 100 MB
+const SMALL_MAX_DURATION_S = 12 * 60; // 12 minutes
 
 /** Stage labels shown in the analysis UI (SPEC "Required processing stages"). */
 export const STAGE_LABELS: string[] = [
@@ -74,8 +89,84 @@ function getTranscribeWorker(): Worker {
   return transcribeWorker;
 }
 
+// Singleton ffmpeg worker for the large-file audio-extraction path. Separate
+// from the export worker so analysis and export never contend for one instance.
+let ffmpegWorker: Worker | null = null;
+function getFfmpegWorker(): Worker {
+  if (!ffmpegWorker) {
+    ffmpegWorker = new Worker(new URL('../workers/ffmpeg.worker.ts', import.meta.url), {
+      type: 'module',
+    });
+  }
+  return ffmpegWorker;
+}
+
 function throwIfAborted(signal: AbortSignal): void {
   if (signal.aborted) throw new DOMException('cancelled', 'AbortError');
+}
+
+interface ExtractChunkMsg {
+  chunkIndex: number;
+  start: number;
+  total: number;
+  pcm: Float32Array;
+}
+
+/**
+ * Stage-1 large-file path: extract the audio track in bounded chunks via the
+ * FFmpeg worker. Reconstructs the full 16kHz mono PCM (for silence detection)
+ * by writing each chunk's samples at their absolute offset — overlaps carry
+ * identical audio, so overwriting is exact — while also collecting the
+ * per-chunk PcmChunk[] the transcription stage consumes (each chunk's buffer
+ * stays independent and is transferred per-chunk to the transcribe worker,
+ * never as one giant buffer). Only one chunk's PCM is in flight worker-side.
+ */
+async function extractLargeAudio(
+  file: File,
+  duration: number,
+  signal: AbortSignal,
+  onChunk: (chunkIndex: number, total: number) => void,
+  onPct: (pct: number) => void,
+): Promise<{ pcm: Float32Array; sampleRate: number; chunks: PcmChunk[] }> {
+  const sampleRate = TARGET_SAMPLE_RATE;
+  const full = new Float32Array(Math.max(1, Math.ceil(duration * sampleRate)));
+  // Keyed by chunk index so a worker-side retry (MT hang → single-thread
+  // restart re-emits chunks from 0) never double-counts.
+  const byIndex = new Map<number, PcmChunk>();
+
+  try {
+    await runJob(
+      getFfmpegWorker(),
+      'extract-audio',
+      { file, chunkS: CHUNK_LEN_S, overlapS: CHUNK_OVERLAP_S, duration },
+      {
+        signal,
+        onProgress: (e) => {
+          const d = e.data as ExtractChunkMsg | undefined;
+          if (d && d.pcm) {
+            const offset = Math.round(d.start * sampleRate);
+            const room = full.length - offset;
+            if (room > 0) {
+              full.set(d.pcm.length > room ? d.pcm.subarray(0, room) : d.pcm, offset);
+            }
+            const end = d.start + d.pcm.length / sampleRate;
+            byIndex.set(d.chunkIndex, { index: d.chunkIndex, start: d.start, end, pcm: d.pcm });
+            onChunk(d.chunkIndex, d.total);
+          } else if (typeof e.pct === 'number') {
+            onPct(e.pct);
+          }
+        },
+      },
+    );
+  } catch (err) {
+    // The worker signals a genuinely silent file with the typed 'no-audio'
+    // message; surface it as NoAudioError so the UI is honest.
+    if (err instanceof Error && err.message === 'no-audio') throw new NoAudioError();
+    throw err;
+  }
+
+  const chunks = Array.from(byIndex.values()).sort((a, b) => a.index - b.index);
+  return { pcm: full, sampleRate, chunks };
 }
 
 /**
@@ -90,23 +181,54 @@ export async function runAnalysis(
   const t0 = Date.now();
   let transcribeStart = 0;
 
-  const emit = (stage: 1 | 2 | 3 | 4 | 5, stagePct: number, eta?: [number, number]): void => {
+  const emit = (
+    stage: 1 | 2 | 3 | 4 | 5,
+    stagePct: number,
+    eta?: [number, number],
+    labelOverride?: string,
+  ): void => {
     onProgress({
       stage,
-      stageLabel: STAGE_LABELS[stage - 1],
+      stageLabel: labelOverride ?? STAGE_LABELS[stage - 1],
       pct: Math.round(overallPct(stage, stagePct)),
       elapsedS: (Date.now() - t0) / 1000,
       etaRangeS: eta,
     });
   };
 
-  // ---- Stage 1: decode audio to 16kHz mono PCM ----------------------------
+  // ---- Stage 1: obtain 16kHz mono PCM + transcription chunks ---------------
+  // Small/short files: fast main-thread decodeAudioData. Large/long files:
+  // bounded-chunk extraction via the FFmpeg worker (decodeAudioData cannot
+  // survive very large inputs — that failure was the reported bug).
   emit(1, 0);
-  const { pcm, sampleRate, duration } = await decodeAudioToPcm(
-    file,
-    (pct) => emit(1, pct),
-    signal,
-  );
+  const useLargePath = file.size > SMALL_MAX_BYTES || meta.duration > SMALL_MAX_DURATION_S;
+  let pcm: Float32Array;
+  let sampleRate: number;
+  let duration: number;
+  let chunks: PcmChunk[];
+  if (useLargePath) {
+    let extractLabel = STAGE_LABELS[0];
+    const res = await extractLargeAudio(
+      file,
+      meta.duration,
+      signal,
+      (chunkIndex, total) => {
+        extractLabel = `${STAGE_LABELS[0]} — chunk ${chunkIndex + 1}/${total}`;
+        emit(1, ((chunkIndex + 1) / total) * 100, undefined, extractLabel);
+      },
+      (pct) => emit(1, pct, undefined, extractLabel),
+    );
+    pcm = res.pcm;
+    sampleRate = res.sampleRate;
+    duration = meta.duration;
+    chunks = res.chunks;
+  } else {
+    const decoded = await decodeAudioToPcm(file, (pct) => emit(1, pct), signal);
+    pcm = decoded.pcm;
+    sampleRate = decoded.sampleRate;
+    duration = decoded.duration;
+    chunks = chunkPcm(pcm, sampleRate, CHUNK_LEN_S, CHUNK_OVERLAP_S);
+  }
   throwIfAborted(signal);
   emit(1, 100);
 
@@ -119,7 +241,6 @@ export async function runAnalysis(
   const checkpoint = await loadCheckpoint(fpKey);
   const savedWords = new Map(checkpoint.chunks);
 
-  const chunks = chunkPcm(pcm, sampleRate, 110, CHUNK_OVERLAP_S);
   const pending = chunks.filter((c) => !savedWords.has(c.index));
 
   // ---- Stages 2 & 3: load whisper + transcribe pending chunks -------------
