@@ -36,6 +36,7 @@ interface AnalysisSlice {
 
 interface EditsSlice {
   cuts: Cut[];
+  setCuts: (cuts: Cut[]) => void;
   toggleCut: (cutId: string) => void;
   addManualCut: (start: number, end: number, reason?: string) => void;
   removeCut: (cutId: string) => void;
@@ -131,6 +132,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   edits: {
     cuts: [],
+    setCuts: (cuts) => set((s) => ({ edits: { ...s.edits, cuts } })),
     toggleCut: (cutId) =>
       set((s) => ({
         edits: {
