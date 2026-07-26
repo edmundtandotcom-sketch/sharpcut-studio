@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { id as makeId } from '../lib/time';
+import { retokenizeBlock } from '../lib/captionTiming';
 import {
   DEFAULT_STUDIO_SETTINGS,
   type AnalysisProgress,
@@ -54,12 +55,22 @@ interface StudioSlice extends StudioSettings {
   setMode: (mode: ExportMode) => void;
   setQuality: (quality: Quality) => void;
   toggleClipIndex: (index: number) => void;
+  setSelectedClipIndices: (indices: number[]) => void;
 }
 
 interface ExportJobSlice {
   progress: ExportProgress | null;
   resultUrls: { name: string; url: string }[];
   error: string | null;
+  // P4->P5 export seam: the Studio Export button flips `requested` true.
+  // P5 (FFmpeg engine) observes this flag to start the real export job.
+  requested: boolean;
+}
+
+// Caption text-editor undo/redo history (snapshots of analysis.captionBlocks).
+interface CaptionEditorSlice {
+  past: CaptionBlock[][];
+  future: CaptionBlock[][];
 }
 
 export interface AppStore {
@@ -81,10 +92,21 @@ export interface AppStore {
 
   studio: StudioSlice;
 
+  // Caption text editor (additive P4 state) — mutates analysis.captionBlocks
+  // through history-tracked actions so edits are undoable/redoable.
+  captionEditor: CaptionEditorSlice;
+  updateCaptionBlock: (blockId: string, text: string) => void;
+  replaceInCaptions: (find: string, replace: string, caseSensitive?: boolean) => number;
+  undoCaptionEdit: () => void;
+  redoCaptionEdit: () => void;
+
   exportJob: ExportJobSlice;
   setExportProgress: (progress: ExportProgress | null) => void;
   setExportResults: (results: { name: string; url: string }[]) => void;
   setExportError: (error: string | null) => void;
+  /** P4->P5 export seam. Studio Export button calls this; P5 engine reacts. */
+  requestExport: () => void;
+  clearExportRequest: () => void;
 
   resetProject: () => void;
 }
@@ -107,7 +129,12 @@ const initialExportJob: ExportJobSlice = {
   progress: null,
   resultUrls: [],
   error: null,
+  requested: false,
 };
+
+const initialCaptionEditor: CaptionEditorSlice = { past: [], future: [] };
+
+const CAPTION_HISTORY_LIMIT = 60;
 
 // Tracks manual cut ids in insertion order so undoLastManual() knows what to pop.
 let manualCutOrder: string[] = [];
@@ -196,7 +223,75 @@ export const useAppStore = create<AppStore>((set, get) => ({
           : [...selected, index];
         return { studio: { ...s.studio, selectedClipIndices: next } };
       }),
+    setSelectedClipIndices: (indices) =>
+      set((s) => ({ studio: { ...s.studio, selectedClipIndices: [...indices].sort((a, b) => a - b) } })),
   },
+
+  captionEditor: initialCaptionEditor,
+  updateCaptionBlock: (blockId, text) =>
+    set((s) => {
+      const blocks = s.analysis.captionBlocks;
+      const target = blocks.find((b) => b.id === blockId);
+      if (!target) return {};
+      const next = blocks.map((b) => (b.id === blockId ? retokenizeBlock(b, text) : b));
+      const past = [...s.captionEditor.past, blocks].slice(-CAPTION_HISTORY_LIMIT);
+      return {
+        analysis: { ...s.analysis, captionBlocks: next },
+        captionEditor: { past, future: [] },
+      };
+    }),
+  replaceInCaptions: (find, replace, caseSensitive = false) => {
+    const query = find;
+    if (!query) return 0;
+    let count = 0;
+    const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(escaped, caseSensitive ? 'g' : 'gi');
+    set((s) => {
+      const blocks = s.analysis.captionBlocks;
+      let changed = false;
+      const next = blocks.map((b) => {
+        if (!re.test(b.text)) return b;
+        re.lastIndex = 0;
+        const matches = b.text.match(re);
+        count += matches ? matches.length : 0;
+        changed = true;
+        return retokenizeBlock(b, b.text.replace(re, replace));
+      });
+      if (!changed) return {};
+      const past = [...s.captionEditor.past, blocks].slice(-CAPTION_HISTORY_LIMIT);
+      return {
+        analysis: { ...s.analysis, captionBlocks: next },
+        captionEditor: { past, future: [] },
+      };
+    });
+    return count;
+  },
+  undoCaptionEdit: () =>
+    set((s) => {
+      const past = s.captionEditor.past;
+      if (past.length === 0) return {};
+      const prev = past[past.length - 1];
+      return {
+        analysis: { ...s.analysis, captionBlocks: prev },
+        captionEditor: {
+          past: past.slice(0, -1),
+          future: [s.analysis.captionBlocks, ...s.captionEditor.future].slice(0, CAPTION_HISTORY_LIMIT),
+        },
+      };
+    }),
+  redoCaptionEdit: () =>
+    set((s) => {
+      const future = s.captionEditor.future;
+      if (future.length === 0) return {};
+      const nextBlocks = future[0];
+      return {
+        analysis: { ...s.analysis, captionBlocks: nextBlocks },
+        captionEditor: {
+          past: [...s.captionEditor.past, s.analysis.captionBlocks].slice(-CAPTION_HISTORY_LIMIT),
+          future: future.slice(1),
+        },
+      };
+    }),
 
   exportJob: initialExportJob,
   setExportProgress: (progress) =>
@@ -204,6 +299,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
   setExportResults: (resultUrls) =>
     set((s) => ({ exportJob: { ...s.exportJob, resultUrls } })),
   setExportError: (error) => set((s) => ({ exportJob: { ...s.exportJob, error } })),
+  requestExport: () =>
+    set((s) => ({ exportJob: { ...s.exportJob, requested: true, error: null } })),
+  clearExportRequest: () =>
+    set((s) => ({ exportJob: { ...s.exportJob, requested: false } })),
 
   resetProject: () => {
     const { project, exportJob } = get();
@@ -217,6 +316,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       analysis: initialAnalysis,
       edits: { ...s.edits, cuts: [] },
       studio: { ...s.studio, ...DEFAULT_STUDIO_SETTINGS },
+      captionEditor: initialCaptionEditor,
       exportJob: initialExportJob,
     }));
   },
