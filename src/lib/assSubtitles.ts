@@ -20,7 +20,7 @@
 
 import type { CaptionStyle } from '../types';
 import type { CaptionCue } from './captionTiming';
-import { CAPTION_PRESETS, applyCase, wordsPerLine, wrapWords } from './captionLayout';
+import { CAPTION_PRESETS, applyCase } from './captionLayout';
 import type { Dims } from './ffmpegFilters';
 
 // Base caption height fraction at 100% — matches CaptionOverlay's baseFraction.
@@ -244,30 +244,25 @@ export function buildAss(cues: CaptionCue[], style: CaptionStyle, dims: Dims, as
     const lead = `{${posOverride}${fadeMs ? `\\fad(${fadeMs},0)` : ''}}`;
 
     if (highlight) {
-      // Karaoke \k fill; each word's highlight fills the gap to the next word.
-      const lineGroups = wrapWords(
-        cue.words.map((wd, i) => ({ wd, i })),
-        wordsPerLine(style.sizePct),
-      );
-      const lineStrs = lineGroups.map((line) =>
-        line
-          .map(({ wd, i }) => {
-            const next = cue.words[i + 1];
-            const hEnd = next ? next.start : cue.end;
-            const k = Math.max(1, Math.round((hEnd - wd.start) * 100));
-            return `{\\k${k}}${escapeText(applyCase(wd.text, effectiveCase))}`;
-          })
-          .join(' '),
-      );
-      events.push(dialogue(cue.start, cue.end, `${lead}${lineStrs.join('\\N')}`));
+      // Karaoke \k fill on a SINGLE line (no \N); each word's highlight fills the
+      // gap to the next word. The cue word count already fits the frame width.
+      const line = cue.words
+        .map((wd, i) => {
+          const next = cue.words[i + 1];
+          const hEnd = next ? next.start : cue.end;
+          const k = Math.max(1, Math.round((hEnd - wd.start) * 100));
+          return `{\\k${k}}${escapeText(applyCase(wd.text, effectiveCase))}`;
+        })
+        .join(' ');
+      events.push(dialogue(cue.start, cue.end, `${lead}${line}`));
       continue;
     }
 
-    // Static text with word-group line wrapping.
-    const lines = wrapWords(cue.words, wordsPerLine(style.sizePct)).map((line) =>
-      line.map((wd) => escapeText(applyCase(wd.text, effectiveCase))).join(' '),
-    );
-    events.push(dialogue(cue.start, cue.end, `${lead}${lines.join('\\N')}`));
+    // Static text on a SINGLE line (no \N) — one meaningful word group per cue.
+    const line = cue.words
+      .map((wd) => escapeText(applyCase(wd.text, effectiveCase)))
+      .join(' ');
+    events.push(dialogue(cue.start, cue.end, `${lead}${line}`));
   }
 
   return `${header}\n${events.join('\n')}\n`;

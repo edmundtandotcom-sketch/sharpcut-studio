@@ -14,6 +14,7 @@
 import type { CaptionBlock, Segment, WordStamp } from '../types';
 import { sourceToOutput } from './cuts';
 import { clamp, id } from './time';
+import { wordsPerCueForSize } from './captionLayout';
 
 /** A word placed on the OUTPUT timeline (seconds), for karaoke highlighting. */
 export interface CueWord {
@@ -42,6 +43,25 @@ export function wordsPerCue(speed: number): number {
   return 6;
 }
 
+/** Options controlling single-line cue chunking (size + frame aspect). */
+export interface CueSizingOptions {
+  /** Caption size percentage (50..300). Larger -> fewer words per cue. */
+  sizePct?: number;
+  /** Output frame aspect (width / height). Narrower -> fewer words per cue. */
+  frameAspect?: number;
+}
+
+/**
+ * Final words-per-cue: the tighter of the speed rule and the caption-size rule
+ * (SPEC "Caption size": reduce words per line at larger sizes; the ≥1.25× speed
+ * reduction composes with this — take the minimum). Always >= 1.
+ */
+export function effectiveWordsPerCue(speed: number, opts: CueSizingOptions = {}): number {
+  const bySpeed = wordsPerCue(speed);
+  const bySize = wordsPerCueForSize(opts.sizePct ?? 100, opts.frameAspect);
+  return Math.max(1, Math.min(bySpeed, bySize));
+}
+
 /** Is a source instant inside a kept segment (i.e. not removed)? */
 export function isKept(t: number, segments: Segment[]): boolean {
   for (const s of segments) {
@@ -68,9 +88,10 @@ export function buildCaptionCues(
   blocks: CaptionBlock[],
   segments: Segment[],
   speed: number,
+  sizing: CueSizingOptions = {},
 ): CaptionCue[] {
   if (segments.length === 0) return [];
-  const cap = wordsPerCue(speed);
+  const cap = effectiveWordsPerCue(speed, sizing);
   const cues: CaptionCue[] = [];
 
   for (const block of blocks) {

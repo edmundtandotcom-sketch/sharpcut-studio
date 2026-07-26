@@ -20,8 +20,16 @@ export const ZoomSection = memo(function ZoomSection({ controller, segments, spe
   const setZooms = useAppStore((s) => s.studio.setZooms);
 
   const bySegment = useMemo(() => {
+    // One row per segment. When a segment has a punch-in plus a later Reset
+    // (auto-suggest on long segments), surface the punch-in as the segment's
+    // primary effect so the dropdown reflects the visible zoom.
     const m = new Map<number, ZoomEffect>();
-    for (const z of zooms) m.set(z.segmentIndex, z);
+    for (const z of zooms) {
+      const existing = m.get(z.segmentIndex);
+      if (!existing || (existing.type === 'reset' && z.type !== 'reset')) {
+        m.set(z.segmentIndex, z);
+      }
+    }
     return m;
   }, [zooms]);
 

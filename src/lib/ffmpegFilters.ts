@@ -11,6 +11,7 @@
 // ============================================================================
 
 import type { OutputFormat, Quality, TransitionType, ZoomEffect } from '../types';
+import { zoomTargetScale } from './zoomSuggest';
 
 /** Round to 4 dp so generated expressions are stable and readable. */
 export function r(n: number): number {
@@ -64,46 +65,53 @@ export function outputDims(format: OutputFormat, srcW: number, srcH: number): Di
 
 // ---------------------------------------------------------------------------
 // Zoom — crop-safe, time-windowed scale expressed as a per-frame crop factor.
-// These constants MIRROR components/studio/previewEffects.ts so the burned zoom
-// matches the studio preview. Keep them in sync if either changes.
+// The held-punch model MIRRORS components/studio/previewEffects.zoomScaleAt so
+// the burned zoom matches the studio preview. Keep them in sync if either
+// changes; both resolve target levels via zoomSuggest.zoomTargetScale.
 // ---------------------------------------------------------------------------
 
-const ZOOM_HOLD_S = 0.45;
-const ZOOM_OUT_PEAK = 1.08;
-const ZOOM_MIN_PEAK = 1.06;
-
-function zoomPeak(z: ZoomEffect): number {
-  if (z.type === 'zoomOut') return ZOOM_OUT_PEAK;
-  return Math.max(ZOOM_MIN_PEAK, z.scale > 1 ? z.scale : 1.12);
-}
-
 /**
- * Build the crop-divisor expression `z(t)` (>= 1) for a segment's zoom pulses,
- * where `t` is OUTPUT seconds relative to the segment start (post-setpts).
+ * Build the crop-divisor expression `z(t)` (>= 1) for a segment's zooms, where
+ * `t` is OUTPUT seconds relative to the segment start (post-setpts). Each effect
+ * fast-ramps from the previous held level to its target and then HOLDS that
+ * tight crop until the next effect in the segment (or, for the final effect, the
+ * segment end). Reset / Zoom Out release to 1.0.
+ *
  * Used as `crop=iw/(z):ih/(z):(iw-iw/(z))/2:(ih-ih/(z))/2,scale=W:H` so the
- * frame is always fully covered (never exposes edges). Returns null when the
- * segment has no active (non-reset) zooms.
+ * frame is always fully covered (never exposes edges) and the crop stays centred
+ * on the current frame. Returns null when the segment ends up at 1.0 throughout
+ * (no visible zoom).
  */
 export function zoomExpr(zooms: ZoomEffect[], segStartSource: number, speed: number): string | null {
   const rate = speed > 0 ? speed : 1;
-  const terms: string[] = [];
-  for (const z of zooms) {
-    if (z.type === 'reset') continue;
-    const t0 = (z.atSource - segStartSource) / rate; // segment-local output seconds
-    const ramp = Math.max(0.05, z.durationMs / 1000);
-    const hold = ZOOM_HOLD_S;
-    const peak = zoomPeak(z);
-    const t1 = t0 + ramp;
-    const t2 = t0 + ramp + hold;
-    const t3 = t2 + ramp;
-    const up = `1+${r(peak - 1)}*(t-${r(t0)})/${r(ramp)}`;
-    const down = `1+${r(peak - 1)}*(1-(t-${r(t2)})/${r(ramp)})`;
-    const pulse = `if(between(t,${r(t0)},${r(t3)}),if(lt(t,${r(t1)}),${up},if(lt(t,${r(t2)}),${r(peak)},${down})),1)`;
-    terms.push(pulse);
+  const levels = zooms
+    .map((z) => ({
+      t0: (z.atSource - segStartSource) / rate, // segment-local output seconds
+      ramp: Math.max(0.05, z.durationMs / 1000),
+      target: zoomTargetScale(z.type, z.scale),
+    }))
+    .sort((a, b) => a.t0 - b.t0);
+  if (levels.length === 0) return null;
+  // No visible zoom anywhere in the segment (e.g. a lone Reset).
+  if (levels.every((l) => l.target <= 1.0001)) return null;
+
+  // Build nested piecewise: for t before the first effect the scale is 1; each
+  // effect owns [t0_i, t0_{i+1}) as a fast ramp from the previous level then a
+  // held target; the last effect holds its target to the segment end.
+  const within = (i: number): string => {
+    const l = levels[i];
+    const prev = i === 0 ? 1 : levels[i - 1].target;
+    const t1 = l.t0 + l.ramp;
+    const frac = `clip((t-${r(l.t0)})/${r(l.ramp)},0,1)`;
+    const ramp = `${r(prev)}+${r(l.target - prev)}*${frac}`;
+    return `if(lt(t,${r(t1)}),${ramp},${r(l.target)})`;
+  };
+  // Assemble from the last effect back to the first.
+  let expr = within(levels.length - 1);
+  for (let i = levels.length - 2; i >= 0; i--) {
+    expr = `if(lt(t,${r(levels[i + 1].t0)}),${within(i)},${expr})`;
   }
-  if (terms.length === 0) return null;
-  let expr = terms[0];
-  for (let i = 1; i < terms.length; i++) expr = `max(${expr},${terms[i]})`;
+  expr = `if(lt(t,${r(levels[0].t0)}),1,${expr})`;
   return `max(1,${expr})`;
 }
 

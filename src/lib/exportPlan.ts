@@ -178,7 +178,10 @@ export function buildExportPlan(input: BuildPlanInput): ExportPlan {
       if (captionsOn) {
         // Rebase captions to this single clip's own timeline (starts at 0).
         const local: Segment[] = [{ index: 0, start: seg.start, end: seg.end }];
-        const cues = buildCaptionCues(input.captionBlocks, local, speed);
+        const cues = buildCaptionCues(input.captionBlocks, local, speed, {
+          sizePct: input.caption.sizePct,
+          frameAspect: dims.w / dims.h,
+        });
         ass = buildAss(cues, input.caption, dims, assFamily);
       }
       return {
@@ -227,7 +230,10 @@ export function buildExportPlan(input: BuildPlanInput): ExportPlan {
 
   let ass: string | null = null;
   if (captionsOn) {
-    const cues = buildCaptionCues(input.captionBlocks, segs, speed);
+    const cues = buildCaptionCues(input.captionBlocks, segs, speed, {
+      sizePct: input.caption.sizePct,
+      frameAspect: dims.w / dims.h,
+    });
     ass = buildAss(cues, input.caption, dims, assFamily);
   }
 

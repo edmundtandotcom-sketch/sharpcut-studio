@@ -5,6 +5,7 @@
 
 import type { Segment, TransitionPoint, TransitionType, ZoomEffect } from '../../types';
 import { sourceToOutput } from '../../lib/cuts';
+import { zoomTargetScale } from '../../lib/zoomSuggest';
 
 function easeOut(x: number): number {
   const c = Math.min(1, Math.max(0, x));
@@ -13,8 +14,11 @@ function easeOut(x: number): number {
 
 /**
  * Crop-safe zoom scale (>= 1, never exposes empty edges) at an output-time
- * instant. Every non-reset zoom is a quick punch pulse: scale up over its
- * duration, hold briefly, release back to 1.
+ * instant. Zooms are real punch-ins, not pulses: each effect fast-ramps to its
+ * target level (transform-origin at the frame centre) and HOLDS that tight crop
+ * until the next effect in the same segment, or the segment end (where it
+ * returns to 1.0). Reset / Zoom Out release back to the full frame. Mirrors the
+ * FFmpeg export math in lib/ffmpegFilters.zoomExpr so preview matches export.
  */
 export function zoomScaleAt(
   zooms: ZoomEffect[],
@@ -22,26 +26,42 @@ export function zoomScaleAt(
   speed: number,
   outputTime: number,
 ): number {
-  let scale = 1;
-  for (const z of zooms) {
-    if (z.type === 'reset') continue;
-    const t0 = sourceToOutput(z.atSource, segments, speed);
-    const ramp = Math.max(0.05, z.durationMs / 1000);
-    const hold = 0.45;
-    const win = ramp + hold + ramp;
-    if (outputTime < t0 || outputTime > t0 + win) continue;
-    const peak = z.type === 'zoomOut' ? 1.08 : Math.max(1.06, z.scale);
-    let s = 1;
-    if (outputTime <= t0 + ramp) {
-      s = 1 + (peak - 1) * easeOut((outputTime - t0) / ramp);
-    } else if (outputTime <= t0 + ramp + hold) {
-      s = peak;
-    } else {
-      s = 1 + (peak - 1) * (1 - easeOut((outputTime - t0 - ramp - hold) / ramp));
+  if (zooms.length === 0) return 1;
+
+  // Find the kept segment (output-time window) containing this instant. Holds
+  // are bounded by the segment: a punch never bleeds into the next segment.
+  for (const seg of segments) {
+    const segOut0 = sourceToOutput(seg.start, segments, speed);
+    const segOut1 = sourceToOutput(seg.end, segments, speed);
+    if (outputTime < segOut0 || outputTime > segOut1) continue;
+
+    const segZooms = zooms
+      .filter((z) => z.segmentIndex === seg.index)
+      .map((z) => ({
+        t0: sourceToOutput(z.atSource, segments, speed),
+        ramp: Math.max(0.05, z.durationMs / 1000),
+        target: zoomTargetScale(z.type, z.scale),
+      }))
+      .sort((a, b) => a.t0 - b.t0);
+    if (segZooms.length === 0) return 1;
+
+    let level = 1; // level before the first effect
+    let scale = 1;
+    for (let i = 0; i < segZooms.length; i++) {
+      const z = segZooms[i];
+      if (outputTime < z.t0) break; // this and later effects have not started
+      if (outputTime <= z.t0 + z.ramp) {
+        // Fast ramp from the previous held level to this effect's target.
+        scale = level + (z.target - level) * easeOut((outputTime - z.t0) / z.ramp);
+      } else {
+        // Held tight crop until the next effect / segment end.
+        scale = z.target;
+      }
+      level = z.target;
     }
-    scale = Math.max(scale, s);
+    return Math.max(1, scale);
   }
-  return scale;
+  return 1;
 }
 
 export interface TransitionVisual {
