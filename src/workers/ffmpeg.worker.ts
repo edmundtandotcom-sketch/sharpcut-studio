@@ -46,6 +46,30 @@ let cancelled = false;
 const fsFiles = new Set<string>();
 let fontsDirMade = false;
 
+// ---- Hang watchdog --------------------------------------------------------
+// The multithreaded core (@ffmpeg/core-mt) can DEADLOCK inside exec() on a bad
+// filtergraph: no progress events, no log lines, no return — forever. The
+// single-thread core fails cleanly (returns code 1) instead. So we run MT first
+// for speed, but guard every exec with an activity watchdog. If an exec emits
+// neither a 'progress' event nor a log line for HANG_MS, we treat the instance
+// as hung, terminate it, and restart the whole job single-thread (once).
+const HANG_MS = 45_000;
+const WATCHDOG_TICK_MS = 5_000;
+// Updated by BOTH the log and progress handlers in makeInstance(); the watchdog
+// compares against it to detect a silent exec.
+let lastActivityAt = 0;
+// Session-sticky verdict: once MT has hung, every later export goes straight to
+// single-thread. Persists for the life of the worker (i.e. the browser tab).
+let mtHungOnce = false;
+
+/** Thrown when the watchdog trips; distinguishes a hang from a clean failure. */
+class HangError extends Error {
+  constructor() {
+    super('ffmpeg-hang');
+    this.name = 'HangError';
+  }
+}
+
 // Progress interpolation state for the currently-running exec.
 let curLabel = 'Preparing';
 let curBase = 0;
@@ -82,12 +106,22 @@ function coreUrls(threaded: boolean): { coreURL: string; wasmURL: string; worker
   };
 }
 
+// Ring buffer of recent FFmpeg log lines, appended to step failures so real
+// encoder errors reach the UI instead of a bare exit code.
+const logTail: string[] = [];
+function pushLog(line: string): void {
+  logTail.push(line);
+  if (logTail.length > 40) logTail.shift();
+}
+
 async function makeInstance(threaded: boolean): Promise<unknown> {
   const f = new FFmpeg();
-  f.on('log', () => {
-    /* logs available for debugging; not surfaced to UI */
+  f.on('log', (e: { message?: string }) => {
+    lastActivityAt = Date.now(); // any log line counts as progress for the watchdog
+    if (typeof e?.message === 'string') pushLog(e.message);
   });
   f.on('progress', (e: { progress?: number }) => {
+    lastActivityAt = Date.now();
     const p = typeof e?.progress === 'number' ? e.progress : 0;
     emit((curBase + curSpan * Math.max(0, Math.min(1, p))) * 100);
   });
@@ -102,8 +136,10 @@ async function makeInstance(threaded: boolean): Promise<unknown> {
 
 async function ensureLoaded(): Promise<void> {
   if (ffmpeg) return;
+  // Multithreaded first for speed — but only if SharedArrayBuffer exists AND MT
+  // hasn't already hung this session. Once it hangs, we never trust it again.
   const hasSAB = typeof SharedArrayBuffer !== 'undefined';
-  if (hasSAB) {
+  if (hasSAB && !mtHungOnce) {
     try {
       ffmpeg = await makeInstance(true);
       usingThreads = true;
@@ -145,6 +181,25 @@ async function writeText(name: string, content: string): Promise<void> {
   fsFiles.add(name);
 }
 
+/**
+ * Race ffmpeg.exec against a hang watchdog. Resolves with exec's return value,
+ * or rejects with HangError if no log/progress activity for HANG_MS. The exec
+ * promise is abandoned on hang; the caller is expected to terminate the (dead)
+ * instance rather than await it.
+ */
+function execWithWatchdog(args: string[]): Promise<unknown> {
+  lastActivityAt = Date.now();
+  let timer: ReturnType<typeof setInterval> | undefined;
+  const watchdog = new Promise<never>((_, reject) => {
+    timer = setInterval(() => {
+      if (Date.now() - lastActivityAt >= HANG_MS) reject(new HangError());
+    }, WATCHDOG_TICK_MS);
+  });
+  return Promise.race([ffmpeg.exec(args) as Promise<unknown>, watchdog]).finally(() => {
+    if (timer !== undefined) clearInterval(timer);
+  });
+}
+
 /** Run one exec as a progress step, advancing the running fraction. */
 let doneUnits = 0;
 let totalUnits = 1;
@@ -154,9 +209,13 @@ async function step(label: string, units: number, args: string[]): Promise<void>
   curBase = doneUnits / totalUnits;
   curSpan = units / totalUnits;
   emit(curBase * 100);
-  const ret = await ffmpeg.exec(args);
+  logTail.length = 0;
+  const ret = await execWithWatchdog(args);
   throwIfCancelled();
-  if (typeof ret === 'number' && ret !== 0) throw new Error(`FFmpeg step failed (${label}), code ${ret}`);
+  if (typeof ret === 'number' && ret !== 0) {
+    const tail = logTail.slice(-12).join('\n');
+    throw new Error(`FFmpeg step failed (${label}), code ${ret}\n${tail}`);
+  }
   doneUnits += units;
   emit((doneUnits / totalUnits) * 100);
 }
@@ -385,27 +444,69 @@ async function cleanup(): Promise<void> {
   fsFiles.clear();
 }
 
+/** One full job attempt: (re)load ffmpeg, then run the plan from scratch. */
+async function attemptJob(msg: RunMessage): Promise<void> {
+  await ensureLoaded();
+  throwIfCancelled();
+  if (msg.type === 'export-combined') {
+    await runCombined(msg.id, msg.payload.plan as CombinedPlan, msg.payload.file);
+  } else {
+    await runClips(msg.id, msg.payload.plan as ClipsPlan, msg.payload.file);
+  }
+}
+
+/**
+ * Tear down a hung/dead ffmpeg instance and reset ALL per-job state so the job
+ * can be retried from the beginning. terminate() kills the ffmpeg worker and
+ * its in-memory FS, so we must NOT try to deleteFile() anything — just drop the
+ * bookkeeping. The retry re-writes input + fonts via runCombined/runClips.
+ */
+function resetForRetry(): void {
+  if (ffmpeg) {
+    try {
+      ffmpeg.terminate();
+    } catch {
+      /* ignore */
+    }
+  }
+  ffmpeg = null;
+  usingThreads = false;
+  fsFiles.clear();
+  fontsDirMade = false;
+  doneUnits = 0;
+  totalUnits = 1;
+  logTail.length = 0;
+}
+
 async function handleRun(msg: RunMessage): Promise<void> {
   curId = msg.id;
   cancelled = false;
   try {
-    await ensureLoaded();
-    throwIfCancelled();
-    if (msg.type === 'export-combined') {
-      await runCombined(msg.id, msg.payload.plan as CombinedPlan, msg.payload.file);
-    } else {
-      await runClips(msg.id, msg.payload.plan as ClipsPlan, msg.payload.file);
+    try {
+      await attemptJob(msg);
+    } catch (err) {
+      // MT hung inside exec: auto-recover once by restarting single-thread.
+      if (err instanceof HangError && usingThreads && !cancelled) {
+        mtHungOnce = true; // session-sticky: all later exports skip MT too
+        resetForRetry();
+        post({ id: msg.id, kind: 'progress', stage: 'Restarting in single-thread mode…', pct: 0 });
+        await attemptJob(msg); // ensureLoaded now picks single-thread
+      } else {
+        throw err;
+      }
     }
   } catch (err) {
     const message =
       err instanceof DOMException && err.name === 'AbortError'
         ? 'cancelled'
-        : err instanceof Error
-          ? err.message
-          : 'Export failed.';
+        : err instanceof HangError
+          ? 'Export stalled and could not recover. Please try again.'
+          : err instanceof Error
+            ? err.message
+            : 'Export failed.';
     post({ id: msg.id, kind: 'error', message });
-    // On cancel/terminate the instance is dead — force a reload next time.
-    if (message === 'cancelled') {
+    // On cancel/terminate/hang the instance is dead — force a reload next time.
+    if (message === 'cancelled' || err instanceof HangError) {
       ffmpeg = null;
       fontsDirMade = false;
     }
