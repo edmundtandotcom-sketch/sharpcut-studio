@@ -166,13 +166,17 @@ export function ReviewScreen() {
       setManualError('Set both an IN and an OUT point before removing a range.');
       return;
     }
-    const start = Math.min(pendingIn, pendingOut);
-    const end = Math.max(pendingIn, pendingOut);
-    if (end - start <= 0) {
+    // Reject invalid ranges with a clear explanation instead of silently
+    // swapping the markers (SPEC "Reject invalid or zero-length ranges").
+    if (pendingOut < pendingIn) {
+      setManualError('OUT must be after IN — the markers were not removed.');
+      return;
+    }
+    if (pendingOut - pendingIn <= 0) {
       setManualError('The IN and OUT points must not be equal — there is nothing to remove.');
       return;
     }
-    addManualCut(start, end, 'Manual cut');
+    addManualCut(pendingIn, pendingOut, 'Manual cut');
     setPendingIn(null);
     setPendingOut(null);
     setManualError(null);

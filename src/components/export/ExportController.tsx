@@ -125,6 +125,28 @@ export function ExportController() {
     return () => window.clearInterval(t);
   }, [running, setExportProgress]);
 
+  // Mirror export progress into the tab title (BUG B) so progress is visible
+  // from the tab strip while this tab is in the background — where the elapsed
+  // ticker is throttled. Driven by worker progress messages, not rAF/timers, so
+  // it keeps advancing when hidden. Restored when the export ends or unmounts.
+  const originalTitleRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (running) {
+      if (originalTitleRef.current === null) originalTitleRef.current = document.title;
+      const pct = Math.round(Math.max(0, Math.min(100, progress?.pct ?? 0)));
+      document.title = `▶ ${pct}% — SharpCut export`;
+    } else if (originalTitleRef.current !== null) {
+      document.title = originalTitleRef.current;
+      originalTitleRef.current = null;
+    }
+  }, [running, progress?.pct]);
+  useEffect(
+    () => () => {
+      if (originalTitleRef.current !== null) document.title = originalTitleRef.current;
+    },
+    [],
+  );
+
   if (!running && !error) return null;
 
   return (

@@ -39,13 +39,14 @@ export function Header() {
             </button>
           )}
 
-          <div className="hidden min-w-0 items-center gap-2 rounded-full border border-border bg-primarySoft px-3 py-1.5 text-xs font-medium text-ink md:flex">
+          {/* Single trust badge — the label collapses to icon-only on small
+           * screens via CSS (sr-only), so there is exactly one element (and one
+           * accessibility node), never two competing copies. */}
+          <div className="flex min-w-0 shrink-0 items-center gap-1.5 rounded-full border border-border bg-primarySoft px-2.5 py-1.5 text-xs font-medium text-primary md:gap-2 md:px-3 md:text-ink">
             <ShieldCheck className="h-4 w-4 shrink-0 text-primary" aria-hidden="true" />
-            <span className="truncate">Processed locally &middot; Your video stays on this device</span>
-          </div>
-          <div className="flex shrink-0 items-center gap-1.5 rounded-full border border-border bg-primarySoft px-2.5 py-1.5 text-primary md:hidden">
-            <ShieldCheck className="h-4 w-4" aria-hidden="true" />
-            <span className="sr-only">Processed locally &middot; your video stays on this device</span>
+            <span className="sr-only truncate md:not-sr-only">
+              Processed locally &middot; Your video stays on this device
+            </span>
           </div>
         </div>
       </div>

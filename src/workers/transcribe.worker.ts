@@ -43,9 +43,12 @@ async function loadModel(jobId: string): Promise<unknown> {
   if (asr) return asr;
 
   const hasWebGPU = typeof (navigator as unknown as { gpu?: unknown }).gpu !== 'undefined';
-  const attempts: { device: 'webgpu' | 'wasm'; dtype: string }[] = hasWebGPU
+  // fp16 encoders are numerically unstable for whisper on some GPUs (garbage or
+  // empty transcripts) — run the encoder at fp32, matching the official
+  // transformers.js whisper-webgpu example.
+  const attempts: { device: 'webgpu' | 'wasm'; dtype: string | Record<string, string> }[] = hasWebGPU
     ? [
-        { device: 'webgpu', dtype: 'fp16' },
+        { device: 'webgpu', dtype: { encoder_model: 'fp32', decoder_model_merged: 'fp32' } },
         { device: 'wasm', dtype: 'q8' },
       ]
     : [{ device: 'wasm', dtype: 'q8' }];
@@ -64,7 +67,8 @@ async function loadModel(jobId: string): Promise<unknown> {
           }
         },
       };
-      asr = await pipeline('automatic-speech-recognition', 'onnx-community/whisper-base', options);
+      // The "_timestamped" export includes cross-attentions, required for word-level timestamps.
+      asr = await pipeline('automatic-speech-recognition', 'onnx-community/whisper-base_timestamped', options);
       currentDevice = attempt.device;
       return asr;
     } catch (err) {

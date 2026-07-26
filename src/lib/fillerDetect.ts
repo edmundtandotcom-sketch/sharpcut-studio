@@ -126,7 +126,10 @@ export function detectFillers(words: WordStamp[], opts: FillerOptions): FillerCa
 
     score = clamp(score, 0, 1);
     const text = r.indices.map((k) => words[k].text).join(' ').replace(/\s+/g, ' ').trim();
-    const reason = `Filler — "${norm(text) || text}"${hasPause ? ' with pause' : ''}`;
+    // Display label: normalise each word individually and re-join with spaces so
+    // multi-word phrases keep their spaces (e.g. "you know", not "youknow").
+    const label = r.indices.map((k) => normed[k]).filter(Boolean).join(' ') || text;
+    const reason = `Filler — "${label}"${hasPause ? ' with pause' : ''}`;
 
     candidates.push({
       wordIndices: r.indices,

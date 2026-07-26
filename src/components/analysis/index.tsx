@@ -35,6 +35,26 @@ export function AnalysisScreen() {
   const abortRef = useRef<AbortController | null>(null);
   const [retryTick, setRetryTick] = useState(0);
   const [elapsed, setElapsed] = useState(0);
+  // Raw underlying error, surfaced in a collapsible "Technical details" section
+  // so failures aren't reduced to an opaque "Something went wrong".
+  const [techDetail, setTechDetail] = useState<string | null>(null);
+
+  // Mirror progress into the tab title so it's visible from the tab strip even
+  // when this tab is in the background (BUG B). Restored on unmount.
+  useEffect(() => {
+    const original = document.title;
+    return () => {
+      document.title = original;
+    };
+  }, []);
+  useEffect(() => {
+    if (error) {
+      document.title = 'Analysis failed — SharpCut';
+      return;
+    }
+    const pct = Math.round(Math.max(0, Math.min(100, progress?.pct ?? 0)));
+    document.title = `▶ ${pct}% — SharpCut`;
+  }, [progress?.pct, error]);
 
   // Elapsed-second ticker (independent of pipeline progress posts).
   useEffect(() => {
@@ -69,6 +89,7 @@ export function AnalysisScreen() {
         const name = err instanceof Error ? err.name : '';
         const msg = err instanceof Error ? err.message : '';
         if (name === 'AbortError' || msg === 'cancelled') return;
+        setTechDetail(msg || (err instanceof Error ? err.name : String(err ?? '')) || null);
         setError(friendlyError(err));
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -82,6 +103,7 @@ export function AnalysisScreen() {
 
   const onRetry = () => {
     setError(null);
+    setTechDetail(null);
     setProgress(null);
     setElapsed(0);
     startedRef.current = false;
@@ -102,6 +124,16 @@ export function AnalysisScreen() {
             </span>
             <h2 className="mt-5 text-xl font-bold text-ink">Analysis didn&rsquo;t finish</h2>
             <p className="mt-2 text-sm leading-relaxed text-muted">{error}</p>
+            {techDetail && (
+              <details className="mt-4 rounded-lg bg-bg px-3 py-2 text-left">
+                <summary className="cursor-pointer text-xs font-semibold text-muted">
+                  Technical details
+                </summary>
+                <p className="mt-2 break-words font-mono text-xs leading-relaxed text-muted">
+                  {techDetail}
+                </p>
+              </details>
+            )}
             <div className="mt-6 flex items-center justify-center gap-3">
               <button
                 type="button"
