@@ -1,0 +1,25 @@
+SharpCut Studio — burned-in caption fonts
+=========================================
+
+The .ttf files in this folder are used by the FFmpeg/libass export pass to
+burn captions into the exported MP4. They are all licensed under the SIL Open
+Font License, Version 1.1 (OFL), and were fetched from the Google Fonts
+repository (https://github.com/google/fonts, /ofl/<family>/).
+
+Bundled families and upstream source:
+
+  Inter-Bold.ttf                 Inter                — ofl/inter
+  Montserrat-Bold.ttf            Montserrat           — ofl/montserrat
+  Poppins-SemiBold.ttf           Poppins              — ofl/poppins
+  Oswald-SemiBold.ttf            Oswald               — ofl/oswald
+  BebasNeue-Regular.ttf          Bebas Neue           — ofl/bebasneue
+  BarlowCondensed-SemiBold.ttf   Barlow Condensed     — ofl/barlowcondensed
+  ArchivoBlack-Regular.ttf       Archivo Black        — ofl/archivoblack
+  Nunito-ExtraBold.ttf           Nunito               — ofl/nunito
+  PlayfairDisplay-SemiBold.ttf   Playfair Display     — ofl/playfairdisplay
+  CourierPrime-Bold.ttf          Courier Prime        — ofl/courierprime
+
+Each family's full OFL text and copyright notice is available in its upstream
+directory at github.com/google/fonts. The OFL permits redistribution and
+embedding of these fonts. These files are shipped only for local, in-browser
+caption rendering; they are not re-sold or offered as a font product.

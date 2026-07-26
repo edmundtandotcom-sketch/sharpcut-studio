@@ -8,6 +8,7 @@ import { AnalysisScreen } from './components/analysis';
 import { ReviewScreen } from './components/review';
 import { StudioScreen } from './components/studio';
 import { ExportScreen } from './components/export';
+import { ExportController } from './components/export/ExportController';
 
 function UnsupportedBrowserBanner({ reasons }: { reasons: string[] }) {
   return (
@@ -41,6 +42,9 @@ function App() {
         {appState === 'studio' && <StudioScreen />}
         {appState === 'complete' && <ExportScreen />}
       </main>
+
+      {/* Drives the FFmpeg export engine + renders the export overlay over any state. */}
+      <ExportController />
     </div>
   );
 }

@@ -19,6 +19,7 @@ export function SummaryBar({ segments, speed }: Props) {
   const quality = useAppStore((s) => s.studio.quality);
   const selected = useAppStore((s) => s.studio.selectedClipIndices);
   const requested = useAppStore((s) => s.exportJob.requested);
+  const exportError = useAppStore((s) => s.exportJob.error);
   const requestExport = useAppStore((s) => s.requestExport);
 
   const outputDuration = keptDuration(segments) / (speed > 0 ? speed : 1);
@@ -72,9 +73,9 @@ export function SummaryBar({ segments, speed }: Props) {
         {clipsEmpty && (
           <p className="mt-2 text-center text-[11px] text-danger">Select at least one clip to export.</p>
         )}
-        {requested && (
-          <p className="mt-2 text-center text-[11px] text-muted">
-            Export request registered. The FFmpeg render engine lands in the next build (P5).
+        {exportError && exportError !== 'cancelled' && (
+          <p className="mt-2 rounded-lg bg-danger/10 px-3 py-2 text-center text-[11px] font-medium text-danger">
+            {exportError}
           </p>
         )}
       </div>
