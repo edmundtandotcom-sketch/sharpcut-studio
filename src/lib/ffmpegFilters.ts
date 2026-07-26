@@ -146,7 +146,11 @@ export function segmentVideoFilter(p: SegmentVideoParams): string {
   parts.push('setsar=1');
   parts.push(`crop=${w}:${h}:(iw-${w})*${r(clamp01(p.cropXf))}:(ih-${h})*${r(clamp01(p.cropYf))}`);
   if (p.zoom) {
-    parts.push(`crop=iw/(${p.zoom}):ih/(${p.zoom}):(iw-iw/(${p.zoom}))/2:(ih-ih/(${p.zoom}))/2`);
+    // Single-quote each arg: the zoom expression contains commas, which would
+    // otherwise be parsed as filter-chain separators.
+    parts.push(
+      `crop='iw/(${p.zoom})':'ih/(${p.zoom})':'(iw-iw/(${p.zoom}))/2':'(ih-ih/(${p.zoom}))/2'`,
+    );
     parts.push(`scale=${w}:${h}`);
   }
   parts.push('format=yuv420p');
