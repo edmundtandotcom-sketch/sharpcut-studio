@@ -128,32 +128,45 @@ function coreUrls(threaded: boolean): { coreURL: string; wasmURL: string; worker
  * revokeWasmUrl) once ffmpeg has finished loading it.
  */
 async function resolveWasmUrl(prefix: string): Promise<string> {
-  const directUrl = `${prefix}ffmpeg-core.wasm`;
-  try {
-    const head = await fetch(directUrl, { method: 'HEAD' });
-    if (head.ok) return directUrl;
-  } catch {
-    /* fall through to part-based loading */
-  }
+  // SPA-fallback servers answer 200 + index.html for ANY missing path, so a
+  // bare status check is meaningless — a response only counts if it isn't
+  // HTML, and the wasm head must start with the magic word (\0asm).
+  const isHtml = (res: Response): boolean =>
+    (res.headers.get('content-type') || '').toLowerCase().includes('html');
+  const hasWasmMagic = (buf: ArrayBuffer): boolean => {
+    const m = new Uint8Array(buf.slice(0, 4));
+    return m[0] === 0x00 && m[1] === 0x61 && m[2] === 0x73 && m[3] === 0x6d;
+  };
 
   const parts: ArrayBuffer[] = [];
   for (let i = 0; ; i++) {
     const partUrl = `${prefix}ffmpeg-core.wasm.part${i}`;
-    let res: Response;
+    let res: Response | null = null;
     try {
       res = await fetch(partUrl);
-    } catch (err) {
-      if (i === 0) throw new Error(`Failed to fetch ${partUrl}: ${String(err)}`);
-      break;
+    } catch {
+      /* treat as missing */
     }
-    if (!res.ok) {
-      if (i === 0) throw new Error(`ffmpeg-core.wasm not found at ${directUrl} or ${partUrl} (status ${res.status})`);
-      break;
-    }
-    parts.push(await res.arrayBuffer());
+    if (!res || !res.ok || isHtml(res)) break;
+    const buf = await res.arrayBuffer();
+    if (i === 0 && !hasWasmMagic(buf)) break;
+    parts.push(buf);
   }
-  const blob = new Blob(parts, { type: 'application/wasm' });
-  return URL.createObjectURL(blob);
+  if (parts.length > 0) {
+    return URL.createObjectURL(new Blob(parts, { type: 'application/wasm' }));
+  }
+
+  // Fallback: a single unsplit ffmpeg-core.wasm (e.g. an older checkout).
+  const directUrl = `${prefix}ffmpeg-core.wasm`;
+  const res = await fetch(directUrl);
+  if (!res.ok || isHtml(res)) {
+    throw new Error(`ffmpeg-core.wasm not found at ${prefix} (no parts, direct fetch failed)`);
+  }
+  const buf = await res.arrayBuffer();
+  if (!hasWasmMagic(buf)) {
+    throw new Error(`ffmpeg-core.wasm at ${prefix} is not valid WebAssembly (server returned a fallback page?)`);
+  }
+  return URL.createObjectURL(new Blob([buf], { type: 'application/wasm' }));
 }
 
 /** Revoke a resolveWasmUrl() result; safe no-op for a direct (non-blob) URL. */
