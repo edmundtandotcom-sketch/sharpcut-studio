@@ -241,22 +241,79 @@ function segmentRenderArgs(spec: SegmentSpec, plan: ExportPlan): string[] {
   return args;
 }
 
-async function concatCopy(files: string[], out: string): Promise<void> {
+/**
+ * concat-demuxer stream copy of `files` into `out`, as one progress step.
+ * The concat list file is deleted immediately after (it is tiny but keeping the
+ * FS tidy avoids stale-name collisions across rolling batches).
+ */
+async function concatCopyStep(files: string[], out: string, units: number): Promise<void> {
   const list = files.map((f) => `file '${f}'`).join('\n') + '\n';
-  const listName = `concat_${out}.txt`;
+  const listName = `cc_${out}.txt`;
   await writeText(listName, list);
   fsFiles.add(out);
-  await step('Joining segments', Math.max(0.3, files.length * 0.05), [
-    '-f',
-    'concat',
-    '-safe',
-    '0',
-    '-i',
-    listName,
-    '-c',
-    'copy',
-    out,
-  ]);
+  await step('Joining segments', units, ['-f', 'concat', '-safe', '0', '-i', listName, '-c', 'copy', out]);
+  await safeDelete(listName);
+}
+
+// ---- Rolling concat --------------------------------------------------------
+// Memory hygiene for long videos: instead of holding ALL rendered segment files
+// in the FFmpeg FS until one final join (input + N segments + joined ≈ 3x the
+// output size, which blows the wasm heap for 100+ segment exports), we fold
+// finished segments into a rolling intermediate every K segments and delete the
+// consumed segment files immediately. The FS then holds at most:
+//   input + one rolling file + ≤K segment files.
+const ROLL_BATCH = 12;
+// Weight of each concat-copy step in the progress model (cheap stream copy).
+const CONCAT_UNITS = 0.3;
+
+/** Concat ops a RollingConcat performs for `len` inputs — for progress budgeting. */
+function countConcats(len: number, k: number): number {
+  return Math.floor(len / k) + 1; // one flush per full batch, plus a finalize
+}
+
+/**
+ * Accumulates segment files and folds them into a single rolling intermediate
+ * every `k` additions. `finalize(out)` concats whatever remains (rolling file +
+ * pending batch) into `out`. Consumed inputs (segments and superseded rolling
+ * files) are deleted from the FS as soon as they are folded in, bounding peak FS
+ * usage. Only ever concats files with matching codec params (all segments are
+ * rendered with identical encode args), so `-c copy` is safe.
+ */
+class RollingConcat {
+  private batch: string[] = [];
+  private roll: string | null = null;
+  private n = 0;
+  constructor(
+    private prefix: string,
+    private k: number,
+  ) {}
+
+  async add(name: string): Promise<void> {
+    this.batch.push(name);
+    if (this.batch.length >= this.k) await this.flush();
+  }
+
+  private async flush(): Promise<void> {
+    if (this.batch.length === 0) return;
+    const inputs = this.roll ? [this.roll, ...this.batch] : [...this.batch];
+    const next = `${this.prefix}_roll${this.n++}.mp4`;
+    await concatCopyStep(inputs, next, CONCAT_UNITS);
+    for (const b of this.batch) await safeDelete(b);
+    if (this.roll) await safeDelete(this.roll);
+    this.roll = next;
+    this.batch = [];
+  }
+
+  /** Produce `out` from all remaining inputs and delete every consumed file. */
+  async finalize(out: string): Promise<void> {
+    const inputs = this.roll ? [this.roll, ...this.batch] : [...this.batch];
+    if (inputs.length === 0) return;
+    await concatCopyStep(inputs, out, CONCAT_UNITS);
+    for (const b of this.batch) await safeDelete(b);
+    if (this.roll) await safeDelete(this.roll);
+    this.roll = null;
+    this.batch = [];
+  }
 }
 
 // ---- Combined export -------------------------------------------------------
@@ -292,28 +349,18 @@ function buildXfadeGraph(
   return { graph, vOut: vprev, aOut: aprev };
 }
 
-async function joinWithTransitions(plan: CombinedPlan): Promise<void> {
-  // 1) concat each run (copy) into a run file.
-  const runFiles: string[] = [];
-  const runDurations: number[] = [];
-  for (let j = 0; j < plan.runs.length; j++) {
-    const idxs = plan.runs[j];
-    const dur = idxs.reduce((sum, i) => sum + plan.segments[i].outDuration, 0);
-    runDurations.push(dur);
-    if (idxs.length === 1) {
-      runFiles.push(plan.segments[idxs[0]].outName);
-    } else {
-      const out = `run${j}.mp4`;
-      const list = idxs.map((i) => `file '${plan.segments[i].outName}'`).join('\n') + '\n';
-      const listName = `runlist${j}.txt`;
-      await writeText(listName, list);
-      fsFiles.add(out);
-      await step('Grouping segments', 0.2, ['-f', 'concat', '-safe', '0', '-i', listName, '-c', 'copy', out]);
-      runFiles.push(out);
-    }
-  }
-
-  // 2) xfade/acrossfade chain across run files. Primary -> fallback -> plain concat.
+/**
+ * xfade/acrossfade chain across the already-built per-run files into joined.mp4.
+ * `runFiles`/`runDurations` are produced during the render loop (each run is
+ * rolling-concatted and its segments deleted as soon as the run finishes), so by
+ * the time we get here the FS holds only the run files — not the raw segments.
+ * Primary transitions -> safe-mode fallback -> plain concat of the run files.
+ */
+async function joinWithTransitions(
+  plan: CombinedPlan,
+  runFiles: string[],
+  runDurations: number[],
+): Promise<void> {
   const inputs: string[] = [];
   for (const f of runFiles) inputs.push('-i', f);
   fsFiles.add('joined.mp4');
@@ -335,9 +382,9 @@ async function joinWithTransitions(plan: CombinedPlan): Promise<void> {
       await attempt(true);
     } catch {
       throwIfCancelled();
-      // Last resort: drop transitions, plain-concat all segment files.
-      const allSegs = plan.segments.map((s) => s.outName);
-      await concatCopy(allSegs, 'joined.mp4');
+      // Last resort: drop transitions, plain-concat the run files (the raw
+      // segments are already gone — folded into the run files by the roller).
+      await concatCopyStep(runFiles, 'joined.mp4', Math.max(CONCAT_UNITS, runFiles.length * CONCAT_UNITS));
     }
   }
 }
@@ -354,8 +401,14 @@ async function captionPass(input: string, ass: string, plan: ExportPlan, output:
 
 async function runCombined(id: string, plan: CombinedPlan, file: File): Promise<void> {
   const N = plan.segments.length;
-  // Weighted units: prepare (0.5) + N renders + join + caption pass.
-  const joinUnits = plan.hasTransitions ? plan.runs.length + plan.runs.length * 0.2 : Math.max(0.3, N * 0.05);
+  // Weighted units: prepare (0.5) + N renders + rolling join + caption pass.
+  // The join is now a series of cheap concat-copy steps (rolling per-run for the
+  // transition path, one straight roller otherwise); budget one CONCAT_UNITS per
+  // concat op, plus the xfade-chain step for the transition path.
+  const joinConcats = plan.hasTransitions
+    ? plan.runs.reduce((s, run) => s + countConcats(run.length, ROLL_BATCH), 0)
+    : countConcats(N, ROLL_BATCH);
+  const joinUnits = joinConcats * CONCAT_UNITS + (plan.hasTransitions ? plan.runs.length : 0);
   const captionUnits = plan.ass ? Math.max(1, N * 0.6) : 0;
   totalUnits = 0.5 + N + joinUnits + captionUnits;
   doneUnits = 0;
@@ -367,24 +420,53 @@ async function runCombined(id: string, plan: CombinedPlan, file: File): Promise<
   doneUnits = 0.5;
   emit((doneUnits / totalUnits) * 100);
 
-  for (let i = 0; i < N; i++) {
-    await step(`Rendering segment ${i + 1}/${N}`, 1, segmentRenderArgs(plan.segments[i], plan));
-    // Segment file is consumed by the join; keep until join reads it.
-    fsFiles.add(plan.segments[i].outName);
-  }
-
   if (plan.hasTransitions) {
-    await joinWithTransitions(plan);
-  } else if (N === 1) {
-    // Single kept segment: still normalise container via concat copy.
-    await concatCopy([plan.segments[0].outName], 'joined.mp4');
+    // Render run-by-run (runs are consecutive segment ranges). Each run is
+    // rolling-concatted into its own run file and its raw segments deleted as
+    // soon as the run finishes, so the FS never holds all N segments at once.
+    // The xfade chain then operates on the run files, as before.
+    const runFiles: string[] = [];
+    const runDurations: number[] = [];
+    let rendered = 0;
+    for (let j = 0; j < plan.runs.length; j++) {
+      const idxs = plan.runs[j];
+      const roller = new RollingConcat(`run${j}`, ROLL_BATCH);
+      for (const segIdx of idxs) {
+        const spec = plan.segments[segIdx];
+        rendered++;
+        await step(`Rendering segment ${rendered}/${N}`, 1, segmentRenderArgs(spec, plan));
+        fsFiles.add(spec.outName);
+        await roller.add(spec.outName);
+      }
+      const runOut = `run${j}.mp4`;
+      await roller.finalize(runOut);
+      runFiles.push(runOut);
+      runDurations.push(idxs.reduce((sum, i) => sum + plan.segments[i].outDuration, 0));
+    }
+    // (b) The largest single block — free it before the join/caption passes.
+    await safeDelete('input');
+    await joinWithTransitions(plan, runFiles, runDurations);
   } else {
-    await concatCopy(plan.segments.map((s) => s.outName), 'joined.mp4');
+    // No transitions: one straight rolling concat across all segments.
+    const roller = new RollingConcat('nc', ROLL_BATCH);
+    for (let i = 0; i < N; i++) {
+      const spec = plan.segments[i];
+      await step(`Rendering segment ${i + 1}/${N}`, 1, segmentRenderArgs(spec, plan));
+      fsFiles.add(spec.outName);
+      await roller.add(spec.outName);
+    }
+    // (b) Free the input before the final join/caption — largest single block.
+    await safeDelete('input');
+    // finalize() normalises even a single kept segment's container via concat copy.
+    await roller.finalize('joined.mp4');
   }
 
   let finalName = 'joined.mp4';
   if (plan.ass) {
     await captionPass('joined.mp4', plan.ass, plan, plan.outputName);
+    // (c) Free the pre-caption master as soon as the burn pass has read it,
+    // before we read the final output — lowers peak FS during the caption pass.
+    await safeDelete('joined.mp4');
     finalName = plan.outputName;
   }
 
@@ -435,6 +517,10 @@ async function runClips(id: string, plan: ClipsPlan, file: File): Promise<void> 
     if (clip.ass) await safeDelete(clip.outputName);
     await safeDelete('captions.ass');
   }
+
+  // (P1b) `input` is needed for EVERY clip render, so it can only be freed after
+  // the last clip. Drop it before we hand the results back.
+  await safeDelete('input');
 
   post({ id, kind: 'result', payload: { files, threads: usingThreads } }, transfer);
 }
@@ -583,6 +669,45 @@ function resetForRetry(): void {
   logTail.length = 0;
 }
 
+/** Last few FFmpeg log lines, appended to every export error for diagnosis. */
+function tailLog(): string {
+  const tail = logTail.slice(-8);
+  return tail.length ? `\n\nRecent log:\n${tail.join('\n')}` : '';
+}
+
+/**
+ * Turn whatever was thrown into an honest, user-surfaced message. A NON-Error
+ * throw (e.g. a wasm "abort"/emscripten string, or an OOM RuntimeError with no
+ * clean `.message`) used to collapse to the opaque "Export failed." — instead we
+ * stringify the value, add any `.message`, and ALWAYS append the log-ring tail.
+ * When the cause looks like memory exhaustion we add the spec's guidance.
+ */
+function buildErrorMessage(err: unknown): string {
+  if (err instanceof DOMException && err.name === 'AbortError') return 'cancelled';
+  if (err instanceof HangError) {
+    return 'Export stalled and could not recover. Please try again.' + tailLog();
+  }
+  let base: string;
+  if (err instanceof Error) {
+    base = err.message || err.name || String(err);
+  } else {
+    base = String(err);
+    // Non-Error objects can still carry a useful `.message` (emscripten aborts).
+    const m = (err as { message?: unknown })?.message;
+    if (m != null && String(m) !== base) base = `${base} (${String(m)})`;
+  }
+  if (!base || base === '[object Object]') base = 'Export failed.';
+  let message = base + tailLog();
+  // Memory-exhaustion heuristic across the message AND the log tail: wasm OOM
+  // surfaces as "abort", "OOM", "out of memory", or "Cannot enlarge memory".
+  const haystack = `${base}\n${logTail.join('\n')}`;
+  if (/\babort\b|OOM|out of memory|memory|Cannot enlarge|enlarge/i.test(haystack)) {
+    message +=
+      '\n\nThis looks like a memory limit. Try Individual clips mode, Standard quality, or a shorter video.';
+  }
+  return message;
+}
+
 async function handleRun(msg: RunMessage): Promise<void> {
   curId = msg.id;
   cancelled = false;
@@ -601,14 +726,7 @@ async function handleRun(msg: RunMessage): Promise<void> {
       }
     }
   } catch (err) {
-    const message =
-      err instanceof DOMException && err.name === 'AbortError'
-        ? 'cancelled'
-        : err instanceof HangError
-          ? 'Export stalled and could not recover. Please try again.'
-          : err instanceof Error
-            ? err.message
-            : 'Export failed.';
+    const message = buildErrorMessage(err);
     post({ id: msg.id, kind: 'error', message });
     // On cancel/terminate/hang the instance is dead — force a reload next time.
     if (message === 'cancelled' || err instanceof HangError) {
