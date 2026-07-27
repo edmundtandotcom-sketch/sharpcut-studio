@@ -255,65 +255,48 @@ async function concatCopyStep(files: string[], out: string, units: number): Prom
   await safeDelete(listName);
 }
 
-// ---- Rolling concat --------------------------------------------------------
-// Memory hygiene for long videos: instead of holding ALL rendered segment files
-// in the FFmpeg FS until one final join (input + N segments + joined ≈ 3x the
-// output size, which blows the wasm heap for 100+ segment exports), we fold
-// finished segments into a rolling intermediate every K segments and delete the
-// consumed segment files immediately. The FS then holds at most:
-//   input + one rolling file + ≤K segment files.
-const ROLL_BATCH = 12;
 // Weight of each concat-copy step in the progress model (cheap stream copy).
 const CONCAT_UNITS = 0.3;
 
-/** Concat ops a RollingConcat performs for `len` inputs — for progress budgeting. */
-function countConcats(len: number, k: number): number {
-  return Math.floor(len / k) + 1; // one flush per full batch, plus a finalize
+// ---- Segment vault (FS eviction) -------------------------------------------
+// Memory hygiene for long videos. The wasm32 address space (~2 GB, and for the
+// multithreaded core a FIXED-maximum SharedArrayBuffer that cannot grow past its
+// build-time cap) must hold: the input (573 MB for a 30-min clip, resident the
+// whole render because every segment seeks into it) + every rendered segment +
+// the join output. The emscripten heap only ever GROWS — but it REUSES freed
+// MEMFS space. So the winning move is to remove each finished segment's bytes
+// from the FS entirely the instant it is rendered, parking them in the worker's
+// OWN JS heap (a separate address space from the wasm memory). During the render
+// the FS then holds only: input + the one in-flight segment. At join time the
+// payloads are written back and concat-copied into the final file.
+//
+// (A rolling concat — folding segments into one growing intermediate — does NOT
+// help here: the rolling file keeps the same total bytes resident in the FS
+// during the render, which is exactly where the OOM strikes.)
+let vault: { name: string; data: Uint8Array }[] = [];
+
+/** Move a just-rendered FS file into the worker JS heap and free its MEMFS bytes. */
+async function evictToVault(name: string): Promise<void> {
+  // Copy detaches from the MEMFS-backed buffer so deleteFile can reclaim it.
+  const data = new Uint8Array((await ffmpeg.readFile(name)) as Uint8Array);
+  await safeDelete(name);
+  vault.push({ name, data });
 }
 
-/**
- * Accumulates segment files and folds them into a single rolling intermediate
- * every `k` additions. `finalize(out)` concats whatever remains (rolling file +
- * pending batch) into `out`. Consumed inputs (segments and superseded rolling
- * files) are deleted from the FS as soon as they are folded in, bounding peak FS
- * usage. Only ever concats files with matching codec params (all segments are
- * rendered with identical encode args), so `-c copy` is safe.
- */
-class RollingConcat {
-  private batch: string[] = [];
-  private roll: string | null = null;
-  private n = 0;
-  constructor(
-    private prefix: string,
-    private k: number,
-  ) {}
-
-  async add(name: string): Promise<void> {
-    this.batch.push(name);
-    if (this.batch.length >= this.k) await this.flush();
+/** Write the named vault entries back into the FS ahead of the join pass. */
+async function restoreFromVault(names: string[]): Promise<void> {
+  const want = new Set(names);
+  for (const v of vault) {
+    if (!want.has(v.name)) continue;
+    await ffmpeg.writeFile(v.name, v.data);
+    fsFiles.add(v.name);
   }
+}
 
-  private async flush(): Promise<void> {
-    if (this.batch.length === 0) return;
-    const inputs = this.roll ? [this.roll, ...this.batch] : [...this.batch];
-    const next = `${this.prefix}_roll${this.n++}.mp4`;
-    await concatCopyStep(inputs, next, CONCAT_UNITS);
-    for (const b of this.batch) await safeDelete(b);
-    if (this.roll) await safeDelete(this.roll);
-    this.roll = next;
-    this.batch = [];
-  }
-
-  /** Produce `out` from all remaining inputs and delete every consumed file. */
-  async finalize(out: string): Promise<void> {
-    const inputs = this.roll ? [this.roll, ...this.batch] : [...this.batch];
-    if (inputs.length === 0) return;
-    await concatCopyStep(inputs, out, CONCAT_UNITS);
-    for (const b of this.batch) await safeDelete(b);
-    if (this.roll) await safeDelete(this.roll);
-    this.roll = null;
-    this.batch = [];
-  }
+/** Drop a vault entry's JS-heap bytes once the join has consumed its FS copy. */
+function releaseVault(name: string): void {
+  const i = vault.findIndex((v) => v.name === name);
+  if (i >= 0) vault.splice(i, 1);
 }
 
 // ---- Combined export -------------------------------------------------------
@@ -350,17 +333,37 @@ function buildXfadeGraph(
 }
 
 /**
- * xfade/acrossfade chain across the already-built per-run files into joined.mp4.
- * `runFiles`/`runDurations` are produced during the render loop (each run is
- * rolling-concatted and its segments deleted as soon as the run finishes), so by
- * the time we get here the FS holds only the run files — not the raw segments.
- * Primary transitions -> safe-mode fallback -> plain concat of the run files.
+ * Join the rendered segments (currently parked in the vault) with transitions.
+ * Each run's segment payloads are restored to the FS and concat-copied into a
+ * run file (whose bytes are then released from the vault); the xfade/acrossfade
+ * chain runs across those run files. Restoring run-by-run keeps the FS bounded to
+ * the already-built run files + the current run's segments rather than every
+ * segment at once. Primary transitions -> safe-mode fallback -> plain concat.
  */
-async function joinWithTransitions(
-  plan: CombinedPlan,
-  runFiles: string[],
-  runDurations: number[],
-): Promise<void> {
+async function joinWithTransitions(plan: CombinedPlan): Promise<void> {
+  const runFiles: string[] = [];
+  const runDurations: number[] = [];
+  for (let j = 0; j < plan.runs.length; j++) {
+    const idxs = plan.runs[j];
+    const segNames = idxs.map((i) => plan.segments[i].outName);
+    await restoreFromVault(segNames);
+    runDurations.push(idxs.reduce((sum, i) => sum + plan.segments[i].outDuration, 0));
+    if (segNames.length === 1) {
+      // The restored segment IS the run file; its vault copy is now redundant.
+      releaseVault(segNames[0]);
+      runFiles.push(segNames[0]);
+    } else {
+      const runOut = `run${j}.mp4`;
+      await concatCopyStep(segNames, runOut, CONCAT_UNITS);
+      for (const n of segNames) {
+        await safeDelete(n);
+        releaseVault(n);
+      }
+      runFiles.push(runOut);
+    }
+  }
+  vault = [];
+
   const inputs: string[] = [];
   for (const f of runFiles) inputs.push('-i', f);
   fsFiles.add('joined.mp4');
@@ -401,17 +404,14 @@ async function captionPass(input: string, ass: string, plan: ExportPlan, output:
 
 async function runCombined(id: string, plan: CombinedPlan, file: File): Promise<void> {
   const N = plan.segments.length;
-  // Weighted units: prepare (0.5) + N renders + rolling join + caption pass.
-  // The join is now a series of cheap concat-copy steps (rolling per-run for the
-  // transition path, one straight roller otherwise); budget one CONCAT_UNITS per
-  // concat op, plus the xfade-chain step for the transition path.
-  const joinConcats = plan.hasTransitions
-    ? plan.runs.reduce((s, run) => s + countConcats(run.length, ROLL_BATCH), 0)
-    : countConcats(N, ROLL_BATCH);
-  const joinUnits = joinConcats * CONCAT_UNITS + (plan.hasTransitions ? plan.runs.length : 0);
+  // Weighted units: prepare (0.5) + N renders + join concats + caption pass.
+  const joinUnits = plan.hasTransitions
+    ? plan.runs.filter((r) => r.length > 1).length * CONCAT_UNITS + plan.runs.length
+    : CONCAT_UNITS;
   const captionUnits = plan.ass ? Math.max(1, N * 0.6) : 0;
   totalUnits = 0.5 + N + joinUnits + captionUnits;
   doneUnits = 0;
+  vault = [];
 
   curLabel = usingThreads ? 'Preparing' : 'Preparing — single-thread mode (slower)';
   emit(0);
@@ -420,45 +420,33 @@ async function runCombined(id: string, plan: CombinedPlan, file: File): Promise<
   doneUnits = 0.5;
   emit((doneUnits / totalUnits) * 100);
 
+  // Render every segment, evicting each to the worker JS heap the instant it is
+  // done (see the segment-vault note). The FS holds only input + one segment,
+  // so the render phase no longer accumulates toward the wasm memory ceiling.
+  for (let i = 0; i < N; i++) {
+    const spec = plan.segments[i];
+    await step(`Rendering segment ${i + 1}/${N}`, 1, segmentRenderArgs(spec, plan));
+    fsFiles.add(spec.outName);
+    await evictToVault(spec.outName);
+  }
+
+  // (b) Free the input (the largest single block) before the join/caption pass.
+  await safeDelete('input');
+
   if (plan.hasTransitions) {
-    // Render run-by-run (runs are consecutive segment ranges). Each run is
-    // rolling-concatted into its own run file and its raw segments deleted as
-    // soon as the run finishes, so the FS never holds all N segments at once.
-    // The xfade chain then operates on the run files, as before.
-    const runFiles: string[] = [];
-    const runDurations: number[] = [];
-    let rendered = 0;
-    for (let j = 0; j < plan.runs.length; j++) {
-      const idxs = plan.runs[j];
-      const roller = new RollingConcat(`run${j}`, ROLL_BATCH);
-      for (const segIdx of idxs) {
-        const spec = plan.segments[segIdx];
-        rendered++;
-        await step(`Rendering segment ${rendered}/${N}`, 1, segmentRenderArgs(spec, plan));
-        fsFiles.add(spec.outName);
-        await roller.add(spec.outName);
-      }
-      const runOut = `run${j}.mp4`;
-      await roller.finalize(runOut);
-      runFiles.push(runOut);
-      runDurations.push(idxs.reduce((sum, i) => sum + plan.segments[i].outDuration, 0));
-    }
-    // (b) The largest single block — free it before the join/caption passes.
-    await safeDelete('input');
-    await joinWithTransitions(plan, runFiles, runDurations);
+    await joinWithTransitions(plan);
   } else {
-    // No transitions: one straight rolling concat across all segments.
-    const roller = new RollingConcat('nc', ROLL_BATCH);
-    for (let i = 0; i < N; i++) {
-      const spec = plan.segments[i];
-      await step(`Rendering segment ${i + 1}/${N}`, 1, segmentRenderArgs(spec, plan));
-      fsFiles.add(spec.outName);
-      await roller.add(spec.outName);
+    // Restore all segment payloads and concat-copy them into joined.mp4. This is
+    // the one point that needs the full output resident (peak ≈ 2× output, with
+    // the input already evicted). A single copy normalises even one segment.
+    const names = plan.segments.map((s) => s.outName);
+    await restoreFromVault(names);
+    await concatCopyStep(names, 'joined.mp4', joinUnits);
+    for (const n of names) {
+      await safeDelete(n);
+      releaseVault(n);
     }
-    // (b) Free the input before the final join/caption — largest single block.
-    await safeDelete('input');
-    // finalize() normalises even a single kept segment's container via concat copy.
-    await roller.finalize('joined.mp4');
+    vault = [];
   }
 
   let finalName = 'joined.mp4';
@@ -538,6 +526,7 @@ async function cleanup(): Promise<void> {
   const names = Array.from(fsFiles);
   for (const name of names) await safeDelete(name);
   fsFiles.clear();
+  vault = []; // release any parked segment payloads from the worker JS heap
 }
 
 // ---- Chunked audio extraction (analysis stage 1 for large/long videos) -----
@@ -663,6 +652,7 @@ function resetForRetry(): void {
   ffmpeg = null;
   usingThreads = false;
   fsFiles.clear();
+  vault = [];
   fontsDirMade = false;
   doneUnits = 0;
   totalUnits = 1;
