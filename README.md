@@ -177,13 +177,23 @@ build is served; no user data is stored server-side to migrate or lose.
 
 ## Known limitations
 
-- **Practical length ceiling:** tested up to ~60 minutes. Longer videos may
-  exceed the ~2 GB/2 GB-WASM-memory-per-instance ceiling or simply run slowly
-  in-browser; analysis checkpoints to IndexedDB so an interrupted long run can
-  resume instead of restarting.
-- **WASM memory ceiling:** the FFmpeg WebAssembly heap is capped around 2 GB.
-  Very large/long exports (especially at Source-conscious quality) can hit
-  this; the app warns before starting a high-risk export.
+- **Practical length ceiling:** a 30-minute / 573 MB / 116-segment combined
+  export (Standard quality, Clean captions) has been run end-to-end to a valid
+  file; the full run took ~40 minutes in-browser (~20 min rendering, ~19 min
+  caption burn). Longer/larger videos may simply run slowly; analysis
+  checkpoints to IndexedDB so an interrupted long run can resume instead of
+  restarting.
+- **WASM memory ceiling:** the FFmpeg WebAssembly heap is capped around 2 GB
+  (and the multithreaded core's SharedArrayBuffer cannot grow past its build-
+  time maximum). Two things make long combined exports fit: (1) each rendered
+  segment is evicted from the wasm FS into the worker's JS heap the instant it
+  is done, so the render never accumulates segment bytes in wasm memory; and
+  (2) because `ffmpeg.wasm` leaks heap on every `exec()` call, the export
+  recreates the FFmpeg instance every 25 segments (and once before the caption
+  burn) to reset the leaked heap — the evicted segments survive the teardown and
+  are written back at join time. If an export still exhausts memory, the failure
+  message says so and suggests Individual clips mode, Standard quality, or a
+  shorter video; the app also warns before starting a high-risk export.
 - **Single-thread fallback is slower:** without cross-origin isolation (COOP/
   COEP) headers, FFmpeg export runs single-threaded and takes noticeably
   longer (measured ~3× slower than the multithreaded core on the same clip).
@@ -284,6 +294,7 @@ job, which then completed — exactly the designed behaviour.
 | Transitions | manual cut → 2 kept segments, Quick Fade @ boundary, Combined/Original/Standard | PASS — went straight to single-thread (MT already disabled), `Rendering 1/2 → 2/2 → Joining with transitions` (**primary xfade path**, no safe-mode/plain-concat fallback) → captions → `…-sharpcut.mp4` (1.01 MB). No xfade error surfaced. First real exercise of the transitions path. |
 | Clips | 2 clips selected, Original/Standard | PASS — `…-clip-01.mp4` (0.50 MB) + `…-clip-02.mp4` (0.53 MB); "Download all (ZIP)" click threw no error, `exportJob.error` null |
 | Speed remap | 1.5×, Combined/Original/no captions | PASS — output audio duration **20.04s** vs expected `30.066 / 1.5 = 20.04s` (probed via `decodeAudioData`) |
+| Long combined (memory) | test-30min.mp4 (573 MB), Combined/Original/Standard/Clean, 115 active cuts → **116 segments** | PASS — full render (4 instance recycles) → join → caption burn → `test-30min-sharpcut.mp4` (**62.1 MB, 1684.9s, 1280×720**, decodes clean). ~40 min wall-clock (~20 min render, ~19 min burn). Previously OOM'd mid-render (`RuntimeError: memory access out of bounds` ~segment 40); fixed by evicting rendered segments to the JS heap + recreating the FFmpeg instance every 25 segments to reset `ffmpeg.wasm`'s per-`exec()` heap leak. |
 
 ### Known environment notes / limitations found
 
