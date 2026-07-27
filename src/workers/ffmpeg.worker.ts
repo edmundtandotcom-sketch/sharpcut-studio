@@ -168,6 +168,38 @@ async function writeInput(file: File): Promise<void> {
   fsFiles.add('input');
 }
 
+// Recreate segments per instance before it is recycled. ffmpeg.wasm accumulates
+// (leaks) heap across successive exec() calls on one instance — the CLI assumes
+// process exit reclaims everything, but the persistent wasm instance never does.
+// For a 100+ segment combined export this leak, on top of the resident ~573 MB
+// input, exhausts the wasm memory (OOM ~40 execs in) no matter how tidy the FS
+// is. Tearing the instance down and recreating it resets the heap; rendered
+// segments survive in the JS-heap vault (which the teardown does not touch), so
+// nothing is lost. Kept comfortably below the observed ~40-exec failure point.
+const RECYCLE_EVERY = 25;
+
+/**
+ * Terminate the current ffmpeg instance (freeing its leaked heap + its whole FS)
+ * and stand up a fresh one, re-writing the resident input and fonts. Vault
+ * contents (already-rendered segments) are untouched. Used mid-render to keep a
+ * long combined export under the wasm memory ceiling.
+ */
+async function recycleFfmpeg(plan: ExportPlan, file: File, withInput = true): Promise<void> {
+  throwIfCancelled();
+  try {
+    ffmpeg.terminate();
+  } catch {
+    /* ignore */
+  }
+  ffmpeg = null;
+  fsFiles.clear(); // the FS died with the instance
+  fontsDirMade = false;
+  await ensureLoaded();
+  throwIfCancelled();
+  if (withInput) await writeInput(file);
+  await writeFonts(plan);
+}
+
 async function writeFonts(plan: ExportPlan): Promise<void> {
   if (!plan.fonts.length) return;
   if (!fontsDirMade) {
@@ -421,17 +453,28 @@ async function runCombined(id: string, plan: CombinedPlan, file: File): Promise<
   emit((doneUnits / totalUnits) * 100);
 
   // Render every segment, evicting each to the worker JS heap the instant it is
-  // done (see the segment-vault note). The FS holds only input + one segment,
-  // so the render phase no longer accumulates toward the wasm memory ceiling.
+  // done (see the segment-vault note) and recycling the ffmpeg instance every
+  // RECYCLE_EVERY segments to reset the per-exec heap leak. The FS holds only
+  // input + one segment, and no single instance runs enough execs to OOM.
   for (let i = 0; i < N; i++) {
+    if (i > 0 && i % RECYCLE_EVERY === 0) {
+      curLabel = `Freeing memory (segment ${i + 1}/${N})`;
+      emit((doneUnits / totalUnits) * 100);
+      await recycleFfmpeg(plan, file);
+    }
     const spec = plan.segments[i];
     await step(`Rendering segment ${i + 1}/${N}`, 1, segmentRenderArgs(spec, plan));
     fsFiles.add(spec.outName);
     await evictToVault(spec.outName);
   }
 
-  // (b) Free the input (the largest single block) before the join/caption pass.
-  await safeDelete('input');
+  // Stand up a fresh instance for the memory-heavy join + caption burn: this
+  // drops both the resident ~573 MB input and whatever the last batch of renders
+  // leaked, so the full-length caption re-encode runs against a clean heap. The
+  // rendered segments live in the vault and are restored below.
+  curLabel = 'Freeing memory';
+  emit((doneUnits / totalUnits) * 100);
+  await recycleFfmpeg(plan, file, false);
 
   if (plan.hasTransitions) {
     await joinWithTransitions(plan);
