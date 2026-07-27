@@ -15,9 +15,13 @@ export default defineConfig({
   // preview (`npm run build && npm run preview`) has the same cross-origin
   // isolation as the deployed site, which multithreaded FFmpeg needs.
   preview: {
+    // cors:true lets the deployed site fetch local test fixtures during
+    // QA smoke tests (https page → http://localhost is allowed by Chrome).
+    cors: true,
     headers: {
       'Cross-Origin-Opener-Policy': 'same-origin',
       'Cross-Origin-Embedder-Policy': 'require-corp',
+      'Cross-Origin-Resource-Policy': 'cross-origin',
     },
   },
   optimizeDeps: {
