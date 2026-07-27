@@ -116,6 +116,51 @@ function coreUrls(threaded: boolean): { coreURL: string; wasmURL: string; worker
   };
 }
 
+/**
+ * Resolve the ffmpeg-core.wasm URL for a given core directory prefix
+ * (e.g. ".../ffmpeg/core-mt/"). The full 30+MiB wasm exceeds Cloudflare
+ * Pages' 25MiB per-file limit, so the deployed build ships it pre-split as
+ * sequential `ffmpeg-core.wasm.part0`, `ffmpeg-core.wasm.part1`, … files
+ * instead. This tries the single-file wasm first (keeps `npm run dev` and
+ * any environment that still has the unsplit file working unmodified), and
+ * falls back to fetching parts in order and reassembling them into a Blob
+ * URL. The caller is responsible for revoking the returned object URL (via
+ * revokeWasmUrl) once ffmpeg has finished loading it.
+ */
+async function resolveWasmUrl(prefix: string): Promise<string> {
+  const directUrl = `${prefix}ffmpeg-core.wasm`;
+  try {
+    const head = await fetch(directUrl, { method: 'HEAD' });
+    if (head.ok) return directUrl;
+  } catch {
+    /* fall through to part-based loading */
+  }
+
+  const parts: ArrayBuffer[] = [];
+  for (let i = 0; ; i++) {
+    const partUrl = `${prefix}ffmpeg-core.wasm.part${i}`;
+    let res: Response;
+    try {
+      res = await fetch(partUrl);
+    } catch (err) {
+      if (i === 0) throw new Error(`Failed to fetch ${partUrl}: ${String(err)}`);
+      break;
+    }
+    if (!res.ok) {
+      if (i === 0) throw new Error(`ffmpeg-core.wasm not found at ${directUrl} or ${partUrl} (status ${res.status})`);
+      break;
+    }
+    parts.push(await res.arrayBuffer());
+  }
+  const blob = new Blob(parts, { type: 'application/wasm' });
+  return URL.createObjectURL(blob);
+}
+
+/** Revoke a resolveWasmUrl() result; safe no-op for a direct (non-blob) URL. */
+function revokeWasmUrl(url: string): void {
+  if (url.startsWith('blob:')) URL.revokeObjectURL(url);
+}
+
 // Ring buffer of recent FFmpeg log lines, appended to step failures so real
 // encoder errors reach the UI instead of a bare exit code.
 const logTail: string[] = [];
@@ -136,10 +181,18 @@ async function makeInstance(threaded: boolean): Promise<unknown> {
     emit((curBase + curSpan * Math.max(0, Math.min(1, p))) * 100);
   });
   const urls = coreUrls(threaded);
-  if (threaded) {
-    await f.load({ coreURL: urls.coreURL, wasmURL: urls.wasmURL, workerURL: urls.workerURL });
-  } else {
-    await f.load({ coreURL: urls.coreURL, wasmURL: urls.wasmURL });
+  const prefix = urls.wasmURL.slice(0, urls.wasmURL.length - 'ffmpeg-core.wasm'.length);
+  const wasmURL = await resolveWasmUrl(prefix);
+  try {
+    if (threaded) {
+      await f.load({ coreURL: urls.coreURL, wasmURL, workerURL: urls.workerURL });
+    } else {
+      await f.load({ coreURL: urls.coreURL, wasmURL });
+    }
+  } finally {
+    // Safe once f.load() has resolved (or thrown) — the instance has either
+    // instantiated from the blob already or failed outright.
+    revokeWasmUrl(wasmURL);
   }
   return f;
 }
