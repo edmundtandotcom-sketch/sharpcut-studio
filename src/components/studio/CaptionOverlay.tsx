@@ -117,12 +117,18 @@ export function CaptionOverlay({
     cursor: onBlockPointerDown ? 'grab' : 'default',
   };
 
+  // Per-cue shrink for a single word too wide for the frame (lib/captionTiming).
+  // Everything sized off the font must scale with it or the box stops hugging
+  // the text — and the ASS export applies the same factor via \fscx/\fscy.
+  const cueScale = cue && Number.isFinite(cue.scale) && cue.scale > 0 ? cue.scale : 1;
+  const fontPx = spec.fontSizePx * cueScale;
+
   // Block-level background (block / banner / lowerThird).
   const blockBg = spec.boxMode === 'block' || spec.boxMode === 'banner' || spec.boxMode === 'lowerThird';
   const blockStyle: CSSProperties = {
     fontFamily: spec.fontFamily,
     fontWeight: spec.fontWeight,
-    fontSize: `${spec.fontSizePx}px`,
+    fontSize: `${fontPx}px`,
     letterSpacing: spec.letterSpacing,
     lineHeight: spec.lineHeight,
     textAlign: spec.align,
@@ -130,10 +136,10 @@ export function CaptionOverlay({
     display: 'inline-flex',
     flexDirection: 'column',
     alignItems: isLeft ? 'flex-start' : 'center',
-    padding: blockBg ? `${spec.paddingY}px ${spec.paddingX}px` : 0,
+    padding: blockBg ? `${spec.paddingY * cueScale}px ${spec.paddingX * cueScale}px` : 0,
     background: blockBg ? spec.backgroundColor : 'transparent',
     borderRadius: `${spec.borderRadius}px`,
-    borderLeft: spec.accentEdge ? `${Math.max(3, Math.round(spec.fontSizePx * 0.16))}px solid ${spec.accentColor}` : undefined,
+    borderLeft: spec.accentEdge ? `${Math.max(3, Math.round(fontPx * 0.16))}px solid ${spec.accentColor}` : undefined,
     boxShadow: blockBg ? '0 2px 10px rgba(0,0,0,0.25)' : undefined,
     maxWidth: '100%',
   };
@@ -151,13 +157,13 @@ export function CaptionOverlay({
     };
     if (spec.boxMode === 'perWord') {
       wStyle.background = spec.backgroundColor;
-      wStyle.padding = `${Math.round(spec.paddingY * 0.5)}px ${Math.round(spec.paddingX * 0.5)}px`;
+      wStyle.padding = `${Math.round(spec.paddingY * cueScale * 0.5)}px ${Math.round(spec.paddingX * cueScale * 0.5)}px`;
       wStyle.borderRadius = `${spec.borderRadius || 6}px`;
     }
     if (spec.boxMode === 'bar' && active) {
       wStyle.background = spec.accentColor;
       wStyle.color = spec.textColor;
-      wStyle.padding = `0 ${Math.round(spec.fontSizePx * 0.14)}px`;
+      wStyle.padding = `0 ${Math.round(fontPx * 0.14)}px`;
       wStyle.borderRadius = `${spec.borderRadius}px`;
     }
     if (active && spec.animation === 'wordByWord') {
@@ -194,7 +200,7 @@ export function CaptionOverlay({
               flexWrap: 'nowrap',
               whiteSpace: 'nowrap',
               justifyContent: isLeft ? 'flex-start' : 'center',
-              gap: `${Math.round(spec.fontSizePx * 0.28)}px`,
+              gap: `${Math.round(fontPx * 0.28)}px`,
             }}
           >
             {cue.words.map((w, i) => renderWord(w, i))}

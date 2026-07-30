@@ -181,6 +181,7 @@ export function buildExportPlan(input: BuildPlanInput): ExportPlan {
         const cues = buildCaptionCues(input.captionBlocks, local, speed, {
           sizePct: input.caption.sizePct,
           frameAspect: dims.w / dims.h,
+          style: input.caption,
         });
         ass = buildAss(cues, input.caption, dims, assFamily);
       }
@@ -233,6 +234,7 @@ export function buildExportPlan(input: BuildPlanInput): ExportPlan {
     const cues = buildCaptionCues(input.captionBlocks, segs, speed, {
       sizePct: input.caption.sizePct,
       frameAspect: dims.w / dims.h,
+      style: input.caption,
     });
     ass = buildAss(cues, input.caption, dims, assFamily);
   }

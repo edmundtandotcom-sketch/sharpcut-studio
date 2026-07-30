@@ -1,9 +1,10 @@
-import { useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { ArrowLeft, Wand2 } from 'lucide-react';
 import { useAppStore } from '../../store/useAppStore';
 import { keptSegments } from '../../lib/cuts';
 import { buildCaptionCues } from '../../lib/captionTiming';
-import { formatAspect } from './studioUtils';
+import { resetTextMeasureCache } from '../../lib/textMeasure';
+import { outputDims } from '../../lib/ffmpegFilters';
 import { PreviewColumn } from './PreviewColumn';
 import { ModeSection } from './ModeSection';
 import { FormatSection } from './FormatSection';
@@ -36,14 +37,44 @@ export function StudioScreen() {
 
   const duration = meta?.duration ?? 0;
   const segments = useMemo(() => keptSegments(cuts, duration), [cuts, duration]);
-  const frameAspect = useMemo(() => formatAspect(format, meta), [format, meta]);
+  // Caption fitting must use the EXACT aspect the export uses (lib/exportPlan
+  // passes dims.w/dims.h from outputDims), or preview and export could group
+  // words differently on sources whose dimensions get evened/clamped.
+  const captionFrameAspect = useMemo(() => {
+    const d = outputDims(format, meta?.width ?? 0, meta?.height ?? 0);
+    return d.w / d.h;
+  }, [format, meta]);
+
+  // Caption line fitting MEASURES the real text, so a webfont that finishes
+  // loading after the first measurement invalidates the cached widths. Drop the
+  // cache and force one recompute when the document's font set settles.
+  const [fontsTick, setFontsTick] = useState(0);
+  useEffect(() => {
+    const fonts = document.fonts;
+    if (!fonts) return;
+    let alive = true;
+    const bump = () => {
+      if (!alive) return;
+      resetTextMeasureCache();
+      setFontsTick((t) => t + 1);
+    };
+    void fonts.ready.then(bump);
+    fonts.addEventListener?.('loadingdone', bump);
+    return () => {
+      alive = false;
+      fonts.removeEventListener?.('loadingdone', bump);
+    };
+  }, []);
+
   const cues = useMemo(
     () =>
       buildCaptionCues(captionBlocks, segments, speed, {
         sizePct: caption.sizePct,
-        frameAspect,
+        frameAspect: captionFrameAspect,
+        style: caption,
       }),
-    [captionBlocks, segments, speed, caption.sizePct, frameAspect],
+    // `caption` covers sizePct/font/case/preset — every input the fitter reads.
+    [captionBlocks, segments, speed, caption, captionFrameAspect, fontsTick],
   );
 
   const controller = usePreviewController(segments, speed);
@@ -124,7 +155,11 @@ export function StudioScreen() {
             <FormatSection meta={meta} />
             <SpeedSection />
             <CaptionSection />
-            <CaptionEditorSection controller={actions} activeBlockId={activeBlockId} />
+            <CaptionEditorSection
+              controller={actions}
+              activeBlockId={activeBlockId}
+              segments={segments}
+            />
             <TransitionsSection controller={actions} segments={segments} speed={speed} />
             <ZoomSection controller={actions} segments={segments} speed={speed} />
             <QualitySection />

@@ -224,8 +224,21 @@ export function buildAss(cues: CaptionCue[], style: CaptionStyle, dims: Dims, as
 
   const events: string[] = [];
 
+  /**
+   * Per-cue shrink (lib/captionTiming CaptionCue.scale) — the same factor the
+   * preview overlay applies, expressed as libass \fscx/\fscy so a single
+   * over-wide word stays inside the frame in the burned-in export too.
+   */
+  const scaleOverride = (cue: CaptionCue): string => {
+    const s = Number.isFinite(cue.scale) && cue.scale > 0 ? cue.scale : 1;
+    if (s >= 0.999) return '';
+    const pct = Math.max(1, Math.round(s * 100));
+    return `\\fscx${pct}\\fscy${pct}`;
+  };
+
   for (const cue of cues) {
     if (!cue.words.length) continue;
+    const fsc = scaleOverride(cue);
 
     if (style.preset === 'wordPop') {
       // One word at a time.
@@ -234,14 +247,14 @@ export function buildAss(cues: CaptionCue[], style: CaptionStyle, dims: Dims, as
         const next = cue.words[i + 1];
         const end = next ? next.start : cue.end;
         if (end <= wd.start) continue;
-        const lead = `{${posOverride}${fadeMs ? `\\fad(${fadeMs},0)` : ''}}`;
+        const lead = `{${posOverride}${fsc}${fadeMs ? `\\fad(${fadeMs},0)` : ''}}`;
         const text = escapeText(applyCase(wd.text, effectiveCase));
         events.push(dialogue(wd.start, end, `${lead}${text}`));
       }
       continue;
     }
 
-    const lead = `{${posOverride}${fadeMs ? `\\fad(${fadeMs},0)` : ''}}`;
+    const lead = `{${posOverride}${fsc}${fadeMs ? `\\fad(${fadeMs},0)` : ''}}`;
 
     if (highlight) {
       // Karaoke \k fill on a SINGLE line (no \N); each word's highlight fills the
