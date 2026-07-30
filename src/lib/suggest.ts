@@ -125,11 +125,70 @@ export function buildCaptionBlocks(words: WordStamp[]): CaptionBlock[] {
   return blocks;
 }
 
+/** A seam must land in at least this much silence to beat the plain midpoint. */
+const MIN_SEAM_GAP_S = 0.04;
+
+/**
+ * Choose where to hand over from the earlier chunk to the later one inside the
+ * overlap window [winStart, winEnd].
+ *
+ * A blind time midpoint can land in the MIDDLE of a spoken word, so the word is
+ * half-transcribed by one chunk and half by the other — the locally garbled text
+ * users see roughly every chunk length. Instead: union both chunks' word spans
+ * inside the window, find the LARGEST hole where neither chunk has a word
+ * running, and cut through the middle of it. Falls back to the midpoint when
+ * speech runs continuously across the whole window.
+ *
+ * Pure — no DOM, no worker, unit-verifiable.
+ */
+export function chunkSeamBoundary(
+  before: WordStamp[],
+  after: WordStamp[],
+  winStart: number,
+  winEnd: number,
+): number {
+  const midpoint = (winStart + winEnd) / 2;
+  if (!(winEnd > winStart)) return midpoint;
+
+  // Word spans clipped to the window, from BOTH chunks.
+  const busy: { start: number; end: number }[] = [];
+  for (const list of [before, after]) {
+    for (const w of list) {
+      const s = Math.min(Math.max(w.start, winStart), winEnd);
+      const e = Math.min(Math.max(Math.max(w.end, w.start), winStart), winEnd);
+      if (e > s) busy.push({ start: s, end: e });
+    }
+  }
+  busy.sort((a, b) => a.start - b.start);
+
+  // Walk the union and track the widest hole.
+  let bestGap = -1;
+  let bestMid = midpoint;
+  let cursor = winStart;
+  const consider = (from: number, to: number) => {
+    const gap = to - from;
+    if (gap > bestGap) {
+      bestGap = gap;
+      bestMid = (from + to) / 2;
+    }
+  };
+  for (const b of busy) {
+    if (b.start > cursor) consider(cursor, b.start);
+    cursor = Math.max(cursor, b.end);
+    if (cursor >= winEnd) break;
+  }
+  if (cursor < winEnd) consider(cursor, winEnd);
+
+  return bestGap >= MIN_SEAM_GAP_S ? bestMid : midpoint;
+}
+
 /**
  * Merge per-chunk word lists (each already offset to absolute source time) into
- * one drift-free list. In each 2s overlap the split point is
- * (laterChunkStart + overlap/2): earlier words before it are kept, later words
- * from it onward replace them — deterministic, no drift, no dupes.
+ * one drift-free list. Chunk i overlaps chunk i-1 over
+ * [chunkStarts[i], chunkStarts[i] + overlapS]; the handover point inside that
+ * window is chosen by chunkSeamBoundary so it falls in a pause rather than
+ * mid-word. Earlier words before it are kept, later words from it onward replace
+ * them — deterministic, no drift, no dupes.
  */
 export function mergeChunkWords(
   perChunk: WordStamp[][],
@@ -138,14 +197,21 @@ export function mergeChunkWords(
 ): WordStamp[] {
   const merged: WordStamp[] = [];
   for (let i = 0; i < perChunk.length; i++) {
-    const ws = perChunk[i];
+    const words = perChunk[i];
     if (i === 0) {
-      merged.push(...ws);
+      merged.push(...words);
       continue;
     }
-    const boundary = chunkStarts[i] + overlapS / 2;
+    const winStart = chunkStarts[i];
+    const winEnd = winStart + overlapS;
+    const boundary = chunkSeamBoundary(
+      merged.filter((w) => w.end > winStart && w.start < winEnd),
+      words.filter((w) => w.end > winStart && w.start < winEnd),
+      winStart,
+      winEnd,
+    );
     while (merged.length && merged[merged.length - 1].start >= boundary) merged.pop();
-    for (const w of ws) {
+    for (const w of words) {
       if (w.start >= boundary) merged.push(w);
     }
   }

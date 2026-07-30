@@ -31,7 +31,11 @@ import {
 } from './suggest';
 
 const CHUNK_LEN_S = 110;
-const CHUNK_OVERLAP_S = 2;
+// 5s (was 2s): mergeChunkWords picks the handover point inside this window by
+// searching for the largest inter-word pause, so a wider window is far more
+// likely to contain a real silence and avoid a mid-word seam. Cost is ~3s extra
+// audio per 110s chunk (~3%) — negligible for PCM size and model latency.
+const CHUNK_OVERLAP_S = 5;
 
 // Fast path (main-thread decodeAudioData) is only safe for smaller/shorter
 // files — decodeAudioData loads the whole file into one ArrayBuffer and Chrome
@@ -232,12 +236,15 @@ export async function runAnalysis(
   throwIfAborted(signal);
   emit(1, 100);
 
-  const fpKey = fingerprintKey({
+  // Checkpointed words are stored per chunk INDEX, so the key must also pin the
+  // chunk grid — changing CHUNK_LEN_S/CHUNK_OVERLAP_S remaps index -> time and
+  // would otherwise resurrect stale, misaligned words for an already-seen file.
+  const fpKey = `${fingerprintKey({
     fileName: meta.fileName,
     size: file.size,
     mtime: file.lastModified,
     duration,
-  });
+  })}|c${CHUNK_LEN_S}x${CHUNK_OVERLAP_S}`;
   const checkpoint = await loadCheckpoint(fpKey);
   const savedWords = new Map(checkpoint.chunks);
 
