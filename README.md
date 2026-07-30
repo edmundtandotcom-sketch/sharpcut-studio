@@ -265,6 +265,34 @@ build is served; no user data is stored server-side to migrate or lose.
 - **No accounts, no cloud sync:** by design. Project recovery is local to one
   browser profile on one device; use "Save project file" to move a project
   between devices/browsers.
+- **Caption fonts must be exact-match static instances, not variable fonts:**
+  the `ffmpeg.wasm` build's libass has **no system font provider**
+  ("`can't find selected font provider`" in its logs) — it can only load
+  fonts via `-vf ass=...:fontsdir=fonts`, and it matches the ASS style's
+  `Fontname` against each font file's internal name **by exact string, with
+  zero fallback**. A mismatch renders nothing, silently, with exit code 0 —
+  there is no error to catch. This bit us for real: 5 of the 10 TTFs in
+  `public/fonts/` were **variable fonts**, and libass always resolves a
+  variable font to its **default named instance**, not the weight the
+  filename implies (e.g. `Montserrat-Bold.ttf` resolved to the Thin
+  instance, so every karaoke-preset export — which defaults to Montserrat —
+  had invisible captions; `Nunito-ExtraBold.ttf` didn't resolve to *any*
+  instance at all). The fix was to replace those 5 files with **statically
+  instantiated** TTFs (`fonttools varLib.instancer <file> wght=<weight>
+  --update-name-table`, same filenames, non-variable — no `fvar` table) and
+  correct `assFamily` in `src/lib/captionLayout.ts` to each file's real
+  internal family name. Two naming patterns show up after static
+  instantiation, and both are used in `CAPTION_FONTS` today: Regular/Bold
+  instances keep the plain family name (`"Montserrat"`, `"Inter"`), while
+  non-RIBBI weights fold the weight into the family name (`"Poppins
+  SemiBold"`, `"Barlow Condensed SemiBold"`, `"Oswald SemiBold"`, `"Playfair
+  Display SemiBold"`, `"Nunito ExtraBold"`). **Do not add a new caption font
+  without verifying it empirically** — dump the font's name-table strings
+  (e.g. with `fonttools ttx -t name`) and confirm libass actually logs a
+  `fontselect:` line (not `can't find selected font provider`) for the exact
+  `assFamily` string you intend to ship, using a minimal `.ass` + `-vf ass=`
+  probe against the real `ffmpeg-core.wasm`. Never trust the filename, the
+  `@fontsource` package name, or the OpenType naming convention alone.
 
 ## Architecture overview
 

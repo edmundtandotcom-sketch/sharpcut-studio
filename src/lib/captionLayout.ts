@@ -46,7 +46,7 @@ export const CAPTION_FONTS: Record<CaptionFontId, CaptionFontSpec> = {
     label: 'Classic',
     stack: '"Playfair Display", Georgia, serif',
     weight: 700,
-    assFamily: 'Playfair Display',
+    assFamily: 'Playfair Display SemiBold',
   },
   impact: {
     id: 'impact',
@@ -60,21 +60,21 @@ export const CAPTION_FONTS: Record<CaptionFontId, CaptionFontSpec> = {
     label: 'Editorial',
     stack: '"Playfair Display", Georgia, serif',
     weight: 600,
-    assFamily: 'Playfair Display',
+    assFamily: 'Playfair Display SemiBold',
   },
   creatorRounded: {
     id: 'creatorRounded',
     label: 'Creator Rounded',
     stack: 'Nunito, "Segoe UI", sans-serif',
     weight: 800,
-    assFamily: 'Nunito',
+    assFamily: 'Nunito ExtraBold',
   },
   reelsCondensed: {
     id: 'reelsCondensed',
     label: 'Reels Condensed',
     stack: '"Barlow Condensed", "Arial Narrow", sans-serif',
     weight: 700,
-    assFamily: 'Barlow Condensed',
+    assFamily: 'Barlow Condensed SemiBold',
   },
   heavyBlack: {
     id: 'heavyBlack',
@@ -109,14 +109,14 @@ export const CAPTION_FONTS: Record<CaptionFontId, CaptionFontSpec> = {
     label: 'Poppins Clean',
     stack: 'Poppins, sans-serif',
     weight: 700,
-    assFamily: 'Poppins',
+    assFamily: 'Poppins SemiBold',
   },
   oswald: {
     id: 'oswald',
     label: 'Oswald Creator',
     stack: 'Oswald, sans-serif',
     weight: 700,
-    assFamily: 'Oswald',
+    assFamily: 'Oswald SemiBold',
   },
 };
 
