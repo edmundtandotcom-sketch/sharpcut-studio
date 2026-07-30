@@ -19,8 +19,9 @@ export interface ValidationFailure {
 }
 export type ValidationResult = ValidationSuccess | ValidationFailure;
 
-export const ACCEPTED_EXTENSIONS = ['.mp4', '.mov', '.webm', '.m4v'];
-export const ACCEPT_ATTR = '.mp4,.mov,.webm,.m4v,video/mp4,video/quicktime,video/webm';
+export const ACCEPTED_EXTENSIONS = ['.mp4', '.mov', '.webm', '.m4v', '.mkv'];
+export const ACCEPT_ATTR =
+  '.mp4,.mov,.webm,.m4v,.mkv,video/mp4,video/quicktime,video/webm,video/x-matroska';
 const MAX_RECOMMENDED_BYTES = 2 * 1024 ** 3; // 2 GB
 const MAX_RECOMMENDED_SECONDS = 60 * 60; // 60 min
 const AUDIO_DECODE_PROBE_LIMIT = 60 * 1024 * 1024; // decode-probe files up to 60MB
@@ -162,7 +163,7 @@ export async function validateVideoFile(
     return {
       ok: false,
       error: `"${file.name}" isn't a video type SharpCut can open.`,
-      recovery: 'Choose an MP4, MOV, WebM, or M4V file.',
+      recovery: 'Choose an MP4, MOV, WebM, M4V, or MKV file.',
     };
   }
 

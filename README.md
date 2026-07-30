@@ -11,8 +11,8 @@ backend, no account, and no upload of your video anywhere.
 ## Features
 
 - **Drag-and-drop upload** with format/duration/audio validation (MP4, MOV,
-  WebM, M4V) and clear, plain-language errors for unsupported or corrupted
-  files.
+  WebM, M4V, MKV) and clear, plain-language errors for unsupported or
+  corrupted files.
 - **Automatic analysis**: word-level speech transcription (Whisper, running
   locally in a Web Worker) plus silence detection, feeding a filler-word and
   dead-air cut suggester. Resumable via IndexedDB checkpoints if a long
@@ -267,6 +267,7 @@ plus local FFmpeg CLI cross-checks where noted.
 | Skip-preview | PASS |
 | WebM upload (VP9/Opus) | PASS — validates + decodes to review (test-30s.webm → 55 words) |
 | MOV upload (H.264/AAC) | PASS — validates + decodes to review (test-30s.mov → 55 words) |
+| MKV upload (H.264/AAC) | PASS — Chrome reads metadata + decodes audio natively (no fallback needed); full pipeline verified: upload → analysis (85 words) → export → correct MP4 output |
 | Corrupt file | PASS — 13-byte `test-corrupt.mp4` → "We couldn't read this video." + recovery + "Choose a different video"; no crash |
 | No-audio file | PASS (detection) — `test-noaudio.mp4` audio decode throws → "This video has no audio track." message path; not a crash |
 

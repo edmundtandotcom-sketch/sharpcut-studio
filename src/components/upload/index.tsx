@@ -184,7 +184,7 @@ export function UploadScreen() {
                 Choose video
               </span>
               <p className="mt-5 text-xs text-muted">
-                MP4, MOV, WebM, or M4V &middot; up to ~2 GB / ~60 minutes recommended
+                MP4, MOV, WebM, M4V, or MKV &middot; up to ~2 GB / ~60 minutes recommended
               </p>
             </>
           )}
