@@ -79,6 +79,29 @@ async function loadModel(jobId: string): Promise<unknown> {
   throw lastErr instanceof Error ? lastErr : new Error('Failed to load the speech model.');
 }
 
+// Whisper's feature extractor has a fixed 30s receptive field, and it PADS
+// anything shorter — so a sub-30s buffer is exactly one forward pass. We stay
+// under this by construction (pipeline.ts CHUNK_LEN_S = 28).
+const MODEL_WINDOW_S = 30;
+const SAFE_WINDOW_S = 28;
+const SAMPLE_RATE = 16_000;
+
+/**
+ * Split a chunk's PCM if it somehow exceeds the model window. This is a SAFETY
+ * NET that should never fire: the pipeline guarantees <= 28s. Without it, an
+ * over-long buffer would be silently TRUNCATED to 30s by the feature extractor
+ * (audio lost with no error), which is the class of failure we are fixing.
+ */
+function splitToWindow(pcm: Float32Array): { offsetS: number; pcm: Float32Array }[] {
+  if (pcm.length <= MODEL_WINDOW_S * SAMPLE_RATE) return [{ offsetS: 0, pcm }];
+  const size = SAFE_WINDOW_S * SAMPLE_RATE;
+  const parts: { offsetS: number; pcm: Float32Array }[] = [];
+  for (let a = 0; a < pcm.length; a += size) {
+    parts.push({ offsetS: a / SAMPLE_RATE, pcm: pcm.subarray(a, Math.min(a + size, pcm.length)) });
+  }
+  return parts;
+}
+
 async function transcribe(msg: RunMessage): Promise<void> {
   const jobId = msg.id;
   cancelled = false;
@@ -95,28 +118,38 @@ async function transcribe(msg: RunMessage): Promise<void> {
         return;
       }
       const chunk = chunks[i];
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const out: any = await model(chunk.pcm, {
-        return_timestamps: 'word',
-        chunk_length_s: 30,
-        language: 'english',
-        task: 'transcribe',
-      });
-
-      const rawWords: unknown[] = Array.isArray(out?.chunks) ? out.chunks : [];
-      const words = rawWords
+      const words: { text: string; start: number; end: number }[] = [];
+      for (const part of splitToWindow(chunk.pcm)) {
+        // NOTE: `chunk_length_s` is deliberately NOT passed. Setting it makes
+        // transformers.js run its own long-form windowing + longest-common-
+        // subsequence re-stitching (_call_whisper -> tokenizer._decode_asr),
+        // which silently drops whole spans of real speech. Omitting it takes
+        // the single-forward-pass branch: stride [len,0,0], one generate(), no
+        // merge. Safe because every buffer here is <= 28s by construction.
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        .map((w: any) => {
+        const out: any = await model(part.pcm, {
+          return_timestamps: 'word',
+          language: 'english',
+          task: 'transcribe',
+        });
+
+        const offset = chunk.start + part.offsetS;
+        const rawWords: unknown[] = Array.isArray(out?.chunks) ? out.chunks : [];
+        for (const raw of rawWords) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const w = raw as any;
           const ts = Array.isArray(w?.timestamp) ? w.timestamp : [];
           const s = typeof ts[0] === 'number' ? ts[0] : NaN;
           const e = typeof ts[1] === 'number' ? ts[1] : s;
-          return {
-            text: String(w?.text ?? '').trim(),
-            start: s + chunk.start,
-            end: (Number.isFinite(e) ? e : s) + chunk.start,
-          };
-        })
-        .filter((w) => w.text.length > 0 && Number.isFinite(w.start));
+          const text = String(w?.text ?? '').trim();
+          if (!text || !Number.isFinite(s)) continue;
+          words.push({
+            text,
+            start: s + offset,
+            end: (Number.isFinite(e) ? e : s) + offset,
+          });
+        }
+      }
 
       post({
         id: jobId,

@@ -30,12 +30,36 @@ import {
   mergeChunkWords,
 } from './suggest';
 
-const CHUNK_LEN_S = 110;
-// 5s (was 2s): mergeChunkWords picks the handover point inside this window by
-// searching for the largest inter-word pause, so a wider window is far more
-// likely to contain a real silence and avoid a mid-word seam. Cost is ~3s extra
-// audio per 110s chunk (~3%) — negligible for PCM size and model latency.
-const CHUNK_OVERLAP_S = 5;
+// ---- Chunking: two INDEPENDENT grids --------------------------------------
+//
+// (a) EXTRACT grid — how the FFmpeg worker pulls audio off a large file. Each
+//     chunk costs one ffmpeg exec (seek + decode + FS round-trip), so this stays
+//     coarse. It only affects extraction cost, never transcription accuracy.
+const EXTRACT_CHUNK_LEN_S = 110;
+const EXTRACT_OVERLAP_S = 5;
+//
+// (b) ASR grid — how the PCM is split for the Whisper worker. This MUST stay at
+//     or under the model's own 30s window. transformers.js's ASR pipeline does
+//     its OWN long-form re-chunking whenever the input is longer than
+//     `chunk_length_s` (jump = window - 2*stride) and then stitches the
+//     sub-windows back together with a longest-common-subsequence merge in
+//     `tokenizer._decode_asr`. On real speech that merge silently DROPS whole
+//     spans — a 110s chunk lost 10-28s stretches mid-chunk even though the same
+//     audio transcribes perfectly when fed in as a single <=30s window. So we
+//     make OUR chunking the only chunking: every buffer handed to the model is
+//     short enough to be one single forward pass with no internal windowing.
+//     28s (not 30s) leaves margin so float/rounding can never push a call over.
+//
+//     NOTE: this is a different bug from the chunk-SEAM garbling fixed earlier;
+//     that was about the handover BETWEEN our chunks (see chunkSeamBoundary),
+//     this is content lost INSIDE one of our chunks.
+const CHUNK_LEN_S = 28;
+// 4s handover window: mergeChunkWords picks the seam inside it by searching for
+// the largest inter-word pause, so it needs to be wide enough to usually contain
+// a real silence. ~17% extra audio per chunk — acceptable, and total model
+// forward passes actually DROP versus the old scheme (the library's internal
+// 20s jump produced more 30s windows than our 24s step does).
+const CHUNK_OVERLAP_S = 4;
 
 // Fast path (main-thread decodeAudioData) is only safe for smaller/shorter
 // files — decodeAudioData loads the whole file into one ArrayBuffer and Chrome
@@ -118,12 +142,14 @@ interface ExtractChunkMsg {
 
 /**
  * Stage-1 large-file path: extract the audio track in bounded chunks via the
- * FFmpeg worker. Reconstructs the full 16kHz mono PCM (for silence detection)
- * by writing each chunk's samples at their absolute offset — overlaps carry
- * identical audio, so overwriting is exact — while also collecting the
- * per-chunk PcmChunk[] the transcription stage consumes (each chunk's buffer
- * stays independent and is transferred per-chunk to the transcribe worker,
- * never as one giant buffer). Only one chunk's PCM is in flight worker-side.
+ * FFmpeg worker (EXTRACT grid), reconstructing the full 16kHz mono PCM by
+ * writing each chunk's samples at their absolute offset — overlaps carry
+ * identical audio, so overwriting is exact. Only one chunk's PCM is in flight
+ * worker-side; each arriving buffer is copied into the master and dropped.
+ *
+ * The transcription chunks are NOT taken from this grid — the caller re-splits
+ * the master PCM on the (much finer) ASR grid, so extraction cost and model
+ * window size are decoupled.
  */
 async function extractLargeAudio(
   file: File,
@@ -131,18 +157,16 @@ async function extractLargeAudio(
   signal: AbortSignal,
   onChunk: (chunkIndex: number, total: number) => void,
   onPct: (pct: number) => void,
-): Promise<{ pcm: Float32Array; sampleRate: number; chunks: PcmChunk[] }> {
+): Promise<{ pcm: Float32Array; sampleRate: number; writtenSamples: number }> {
   const sampleRate = TARGET_SAMPLE_RATE;
   const full = new Float32Array(Math.max(1, Math.ceil(duration * sampleRate)));
-  // Keyed by chunk index so a worker-side retry (MT hang → single-thread
-  // restart re-emits chunks from 0) never double-counts.
-  const byIndex = new Map<number, PcmChunk>();
+  let writtenSamples = 0;
 
   try {
     await runJob(
       getFfmpegWorker(),
       'extract-audio',
-      { file, chunkS: CHUNK_LEN_S, overlapS: CHUNK_OVERLAP_S, duration },
+      { file, chunkS: EXTRACT_CHUNK_LEN_S, overlapS: EXTRACT_OVERLAP_S, duration },
       {
         signal,
         onProgress: (e) => {
@@ -151,10 +175,12 @@ async function extractLargeAudio(
             const offset = Math.round(d.start * sampleRate);
             const room = full.length - offset;
             if (room > 0) {
-              full.set(d.pcm.length > room ? d.pcm.subarray(0, room) : d.pcm, offset);
+              const src = d.pcm.length > room ? d.pcm.subarray(0, room) : d.pcm;
+              full.set(src, offset);
+              // A worker-side retry (MT hang → single-thread restart re-emits
+              // chunks from 0) rewrites the same offsets, so max() not +=.
+              writtenSamples = Math.max(writtenSamples, offset + src.length);
             }
-            const end = d.start + d.pcm.length / sampleRate;
-            byIndex.set(d.chunkIndex, { index: d.chunkIndex, start: d.start, end, pcm: d.pcm });
             onChunk(d.chunkIndex, d.total);
           } else if (typeof e.pct === 'number') {
             onPct(e.pct);
@@ -169,8 +195,7 @@ async function extractLargeAudio(
     throw err;
   }
 
-  const chunks = Array.from(byIndex.values()).sort((a, b) => a.index - b.index);
-  return { pcm: full, sampleRate, chunks };
+  return { pcm: full, sampleRate, writtenSamples };
 }
 
 /**
@@ -209,7 +234,9 @@ export async function runAnalysis(
   let pcm: Float32Array;
   let sampleRate: number;
   let duration: number;
-  let chunks: PcmChunk[];
+  // Samples of `pcm` that actually carry audio (the large path allocates from
+  // the container duration, which can slightly over-run the real track).
+  let audioSamples: number;
   if (useLargePath) {
     let extractLabel = STAGE_LABELS[0];
     const res = await extractLargeAudio(
@@ -225,14 +252,22 @@ export async function runAnalysis(
     pcm = res.pcm;
     sampleRate = res.sampleRate;
     duration = meta.duration;
-    chunks = res.chunks;
+    audioSamples = res.writtenSamples || res.pcm.length;
   } else {
     const decoded = await decodeAudioToPcm(file, (pct) => emit(1, pct), signal);
     pcm = decoded.pcm;
     sampleRate = decoded.sampleRate;
     duration = decoded.duration;
-    chunks = chunkPcm(pcm, sampleRate, CHUNK_LEN_S, CHUNK_OVERLAP_S);
+    audioSamples = decoded.pcm.length;
   }
+  // Both paths split on the SAME ASR grid, so the model never has to re-window
+  // internally (see CHUNK_LEN_S). subarray() is a view — chunkPcm copies.
+  const chunks: PcmChunk[] = chunkPcm(
+    audioSamples < pcm.length ? pcm.subarray(0, audioSamples) : pcm,
+    sampleRate,
+    CHUNK_LEN_S,
+    CHUNK_OVERLAP_S,
+  );
   throwIfAborted(signal);
   emit(1, 100);
 
