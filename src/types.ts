@@ -120,5 +120,7 @@ export const DEFAULT_STUDIO_SETTINGS: StudioSettings = {
   transitions: [],
   zooms: [],
   crop: { xPct: 50, yPct: 50 },
-  quality: 'high',
+  // Standard is the recommended default: CRF 23 at the same fast preset is
+  // visually fine for Reels/YouTube and exports noticeably quicker.
+  quality: 'standard',
 };

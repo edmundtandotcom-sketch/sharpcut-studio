@@ -10,6 +10,12 @@
 // multithreaded core is no longer trusted. Core assets are self-hosted (Vite
 // ?url imports) — no CDN.
 //
+// Pass structure (combined): render each kept segment — captions for that
+// segment burned in the SAME exec, via the `ass=` filter the plan appended to
+// its -vf chain — then join. No transitions -> the join is a concat stream copy,
+// so the segment renders are the deliverable content and nothing re-encodes the
+// timeline twice. Clips mode: one render per clip, same in-render burn.
+//
 // Same worker-scope casting trick as transcribe.worker.ts to avoid pulling the
 // webworker lib into the DOM tsconfig.
 // ============================================================================
@@ -356,6 +362,15 @@ async function step(label: string, units: number, args: string[]): Promise<void>
   emit((doneUnits / totalUnits) * 100);
 }
 
+/**
+ * Write the segment's own ASS file (if it has one) into the FS so the `ass=`
+ * filter already baked into spec.vf can find it. Captions burn DURING this
+ * render — there is no separate full-length caption pass any more.
+ */
+async function writeSegmentAss(spec: SegmentSpec): Promise<void> {
+  if (spec.ass && spec.assName) await writeText(spec.assName, spec.ass);
+}
+
 function segmentRenderArgs(spec: SegmentSpec, plan: ExportPlan): string[] {
   const args = ['-ss', String(r(spec.srcStart)), '-i', 'input', '-t', String(r(spec.srcDuration)), '-vf', spec.vf];
   if (plan.hasAudio) {
@@ -518,24 +533,14 @@ async function joinWithTransitions(plan: CombinedPlan): Promise<void> {
   }
 }
 
-async function captionPass(input: string, ass: string, plan: ExportPlan, output: string): Promise<void> {
-  await writeText('captions.ass', ass);
-  const args = ['-i', input, '-vf', 'ass=captions.ass:fontsdir=fonts', ...plan.videoEncode];
-  if (plan.hasAudio) args.push('-c:a', 'copy');
-  else args.push('-an');
-  args.push('-movflags', '+faststart', output);
-  fsFiles.add(output);
-  await step('Burning captions', Math.max(1, plan.fonts.length * 2), args);
-}
-
 async function runCombined(id: string, plan: CombinedPlan, file: File): Promise<void> {
   const N = plan.segments.length;
-  // Weighted units: prepare (0.5) + N renders + join concats + caption pass.
+  // Weighted units: prepare (0.5) + N renders + join concats. Captions are burned
+  // inside the renders, so there is no caption stage to weight any more.
   const joinUnits = plan.hasTransitions
     ? plan.runs.filter((r) => r.length > 1).length * CONCAT_UNITS + plan.runs.length
     : CONCAT_UNITS;
-  const captionUnits = plan.ass ? Math.max(1, N * 0.6) : 0;
-  totalUnits = 0.5 + N + joinUnits + captionUnits;
+  totalUnits = 0.5 + N + joinUnits;
   doneUnits = 0;
   vault = [];
 
@@ -557,15 +562,17 @@ async function runCombined(id: string, plan: CombinedPlan, file: File): Promise<
       await recycleFfmpeg(plan, file);
     }
     const spec = plan.segments[i];
+    await writeSegmentAss(spec);
     await step(`Rendering segment ${i + 1}/${N}`, 1, segmentRenderArgs(spec, plan));
     fsFiles.add(spec.outName);
     await evictToVault(spec.outName);
+    if (spec.assName) await safeDelete(spec.assName);
   }
 
-  // Stand up a fresh instance for the memory-heavy join + caption burn: this
-  // drops both the resident ~573 MB input and whatever the last batch of renders
-  // leaked, so the full-length caption re-encode runs against a clean heap. The
-  // rendered segments live in the vault and are restored below.
+  // Stand up a fresh instance for the memory-heavy join: this drops both the
+  // resident ~573 MB input and whatever the last batch of renders leaked, so the
+  // join runs against a clean heap. The rendered segments live in the vault and
+  // are restored below.
   curLabel = 'Freeing memory';
   emit((doneUnits / totalUnits) * 100);
   await recycleFfmpeg(plan, file, false);
@@ -586,18 +593,10 @@ async function runCombined(id: string, plan: CombinedPlan, file: File): Promise<
     vault = [];
   }
 
-  let finalName = 'joined.mp4';
-  if (plan.ass) {
-    await captionPass('joined.mp4', plan.ass, plan, plan.outputName);
-    // (c) Free the pre-caption master as soon as the burn pass has read it,
-    // before we read the final output — lowers peak FS during the caption pass.
-    await safeDelete('joined.mp4');
-    finalName = plan.outputName;
-  }
-
+  // The join IS the deliverable now — captions are already in the frames.
   curLabel = 'Finishing';
   emit(99);
-  const data = (await ffmpeg.readFile(finalName)) as Uint8Array;
+  const data = (await ffmpeg.readFile('joined.mp4')) as Uint8Array;
   const copy = new Uint8Array(data); // detach from FS buffer for transfer
   post(
     { id, kind: 'result', payload: { files: [{ name: plan.outputName, data: copy }], threads: usingThreads } },
@@ -609,7 +608,8 @@ async function runCombined(id: string, plan: CombinedPlan, file: File): Promise<
 
 async function runClips(id: string, plan: ClipsPlan, file: File): Promise<void> {
   const M = plan.clips.length;
-  totalUnits = 0.5 + M * (1 + (plan.fonts.length ? 0.6 : 0));
+  // One render per clip, captions included (burned in the same pass).
+  totalUnits = 0.5 + M;
   doneUnits = 0;
 
   curLabel = 'Preparing';
@@ -624,23 +624,19 @@ async function runClips(id: string, plan: ClipsPlan, file: File): Promise<void> 
 
   for (let i = 0; i < M; i++) {
     const clip = plan.clips[i];
+    await writeSegmentAss(clip.spec);
     await step(`Rendering clip ${i + 1}/${M}`, 1, segmentRenderArgs(clip.spec, plan));
     fsFiles.add(clip.spec.outName);
 
-    let out = clip.spec.outName;
-    if (clip.ass) {
-      await captionPass(clip.spec.outName, clip.ass, plan, clip.outputName);
-      out = clip.outputName;
-    }
-    const data = (await ffmpeg.readFile(out)) as Uint8Array;
+    // The render IS the deliverable — captions burned in the same pass.
+    const data = (await ffmpeg.readFile(clip.spec.outName)) as Uint8Array;
     const copy = new Uint8Array(data);
     files.push({ name: clip.outputName, data: copy });
     transfer.push(copy.buffer);
 
     // Free this clip's intermediates immediately (bound memory).
     await safeDelete(clip.spec.outName);
-    if (clip.ass) await safeDelete(clip.outputName);
-    await safeDelete('captions.ass');
+    if (clip.spec.assName) await safeDelete(clip.spec.assName);
   }
 
   // (P1b) `input` is needed for EVERY clip render, so it can only be freed after

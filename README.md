@@ -28,7 +28,8 @@ backend, no account, and no upload of your video anywhere.
   - 12 distinct caption creative presets, font/colour/size/case/position
     controls, and a timed caption text editor with undo/redo.
   - Suggested and manual scene transitions, and quick zoom/punch-in effects.
-  - Three export quality tiers (Standard / High / Source-conscious).
+  - Three export quality tiers (Standard — the recommended default — / High /
+    Source-conscious).
 - **Local project recovery**: your edit decisions, transcript, captions, and
   studio settings autosave to IndexedDB as you work, and can also be saved to
   (and reopened from) a portable `sharpcut-project.json` file. See
@@ -185,20 +186,21 @@ build is served; no user data is stored server-side to migrate or lose.
 
 - **Practical length ceiling:** a 30-minute / 573 MB / 116-segment combined
   export (Standard quality, Clean captions) has been run end-to-end to a valid
-  file; the full run took ~40 minutes in-browser (~20 min rendering, ~19 min
-  caption burn). Longer/larger videos may simply run slowly; analysis
-  checkpoints to IndexedDB so an interrupted long run can resume instead of
-  restarting. (Standard quality's FFmpeg arguments were not changed by the
-  encode-speed work below, so that measurement still stands — see the test
-  report.)
+  file; that run took ~40 minutes in-browser (~20 min rendering + ~19 min
+  caption burn). The separate caption-burn pass no longer exists — captions burn
+  inside each segment's own render (below) — so the same job should now land
+  nearer ~20 minutes. ~40 min is simply the last *measured* number for that
+  fixture and is kept as a pessimistic bound. Longer/larger videos may run
+  slowly; analysis checkpoints to IndexedDB so an interrupted long run can
+  resume instead of restarting.
 - **WASM memory ceiling:** the FFmpeg WebAssembly heap is capped around 2 GB
   (and the multithreaded core's SharedArrayBuffer cannot grow past its build-
   time maximum). Two things make long combined exports fit: (1) each rendered
   segment is evicted from the wasm FS into the worker's JS heap the instant it
   is done, so the render never accumulates segment bytes in wasm memory; and
   (2) because `ffmpeg.wasm` leaks heap on every `exec()` call, the export
-  recreates the FFmpeg instance every 25 segments (and once before the caption
-  burn) to reset the leaked heap — the evicted segments survive the teardown and
+  recreates the FFmpeg instance every 25 segments (and once before the join) to
+  reset the leaked heap — the evicted segments survive the teardown and
   are written back at join time. If an export still exhausts memory, the failure
   message says so and suggests Individual clips mode, Standard quality, or a
   shorter video; the app also warns before starting a high-risk export.
@@ -237,24 +239,27 @@ build is served; no user data is stored server-side to migrate or lose.
   **CRF**, not preset: Standard = CRF 23 `veryfast`, High = CRF 19 `veryfast`,
   Source-conscious = CRF 17 `fast`. High and Source used to use `medium`, which
   is what made a 2-minute clip take ~7½ minutes. Additionally, only the pass
-  that produces the deliverable pays for the chosen preset — segment renders
-  (and the xfade join when a caption burn follows) are intermediates that get
-  re-encoded and deleted, so they always use the cheapest preset. This tool
-  targets Reels/YouTube, not archival mastering.
-- **The caption burn is now the dominant cost:** when captions are on, the
-  export re-encodes the *entire* joined output once more through libass. On the
-  2-minute fixture that pass is roughly half the total wall-clock. Turning
-  captions off skips the pass entirely (there is a real "no caption pass" path,
-  not a no-op filter). Burning captions per-segment during the render — which
-  would remove the second full-length encode altogether — is the obvious next
-  optimisation, but it needs caption cues rebased per segment and was left out
-  of scope.
-- **Caption timing after transitions:** each transition trims a small overlap
-  (its crossfade duration) out of the final timeline. Caption sync accounts
-  for cuts and speed changes exactly, but very transition-heavy edits can
-  accumulate roughly ~0.2s of caption drift per transition by the end of the
-  video. Keep transitions to real scene changes (as suggested) rather than
-  every cut to avoid this.
+  that produces the deliverable pays for the chosen preset — an intermediate is
+  output that a later pass re-encodes and deletes, and the only remaining
+  downstream re-encode is the xfade join, so segment renders are intermediates
+  **only when transitions are on**. This tool targets Reels/YouTube, not
+  archival mastering.
+- **Captions are burned during the segment render, not in a second pass:** the
+  export used to re-encode the *entire* joined output once more through libass,
+  which on the 2-minute fixture was roughly half the total wall-clock. Instead,
+  each segment now carries its own ASS file containing just the cues inside its
+  own window, rebased so the segment starts at 0, and its own `ass=` filter at
+  the end of that segment's `-vf` chain. With no transitions the join is then a
+  pure concat stream copy and the segment renders *are* the deliverable, so a
+  captioned export costs one encode of the timeline instead of two (measured:
+  the 2-minute / 8-segment fixture went from ~198s to **~88s**). Turning captions
+  off changes nothing about the pipeline shape — there is simply no `ass=` filter
+  in any command.
+- **No caption drift after transitions (fixed):** captions used to be burned onto
+  the joined timeline, whose length each xfade shortens by its own crossfade
+  duration, so transition-heavy edits accumulated ~0.2s of caption drift per
+  transition. Burning per segment makes captions immune to it — they ride inside
+  the segment's own frames, wherever the join places those frames.
 - **Preview is an approximation:** the live Export Studio preview
   (captions, crop, zoom, transitions) is a close CSS/canvas approximation for
   responsiveness. The exported MP4, rendered by FFmpeg with the same
@@ -361,15 +366,17 @@ longer mention threads at all.
 
 | Export | Settings | Result |
 |---|---|---|
-| **2-minute clip (the reported bug)** | test-2min.mp4 (42 MB, 120.1s), 7 active cuts → **8 segments**, Combined/Original/1×/Clean/**High** | **PASS — and 2.3× faster.** `Rendering segment 1/8 … 8/8` done at ~100s → join at ~100s → caption burn → complete at **197.9s (3m18s)**. Output `test-2min-sharpcut.mp4`: **5.04 MB, 115.84s, 1280×720**, h264 + AAC 48 kHz stereo, captions burned and legible (frame-checked at 33s and 72s against a screen-share source, the worst case for a fast preset). Before this fix: multithreaded core **crawled** (3.68% at 12s, 3.88% at 58s, watchdog never fired — effectively never finishing), and with MT forced off the same export took **~450–470s (7½–8 min)** for a 5.77 MB output. |
-| Combined + captions | test-speech-30s.mp4, Combined/Original/1×/Clean/High | PASS — **~44s to 100%, complete by ~50s** (`test-speech-30s-sharpcut.mp4`, **1.27 MB, 29.87s, 1280×720**, captions burned, frame-checked at 2s). Previously ~86s of single-thread work *after* ~65s wasted on the MT hang + core reload. |
-| Transitions | test-speech-30s.mp4, 2 kept segments, Quick Fade @ boundary, Combined/Original/**High**/Clean | PASS — `Rendering 1/2 → 2/2 → Joining with transitions` (**primary xfade path**, no safe-mode/plain-concat fallback) → burn captions → complete at **~113s**. Output **1.23 MB, 29.57s** — exactly the 29.87s straight-cut duration minus the 0.3s crossfade trim. Exercises the new `joinEncode` pass (segments intermediate, join intermediate, caption burn final). |
+| **2-minute clip (the reported bug)** | test-2min.mp4 (42 MB, 120.1s), 7 active cuts → **8 segments**, Combined/Original/1×/**Karaoke**/**Standard** | **PASS — 87.7s (1m28s)**, with in-render caption burning. `Rendering segment 1/8 … 8/8` (each render now also burns that segment's captions) → `Joining segments` (concat stream copy) → `Finishing`. Output `test-2min-sharpcut.mp4`: **115.79s, 1280×720**. Frame-checked at 33s ("okay, do you think people will") and 72s ("Okay, then you don't want to") — karaoke fill correct, text legible. At output 29.4s (immediately after the removed `29.24–30.84` filler cut) the caption reads "know, let me just share with" — the cut word "You" is gone. **The same fixture measured 197.9s** on the previous architecture (High quality, single full-length caption-burn pass); before *that*, 7½–8 min with MT forced off, and the MT core simply crawled forever. |
+| Combined + captions | test-speech-30s.mp4, Combined/Original/1×/Clean/High | PASS — ~44s to 100%, complete by ~50s (**previous architecture**; `test-speech-30s-sharpcut.mp4`, 1.27 MB, 29.87s, 1280×720, captions burned, frame-checked at 2s). Superseded by the two rows above/below, which measure the in-render burn. |
+| Transitions + captions (drift fix) | test-speech-30s.mp4, manual cut 10–13s → **3 kept segments**, Quick Fade (160ms) @ boundary 2 via the transitions UI, Combined/Original/**Karaoke**/**Standard** | **PASS — 50.1s** (was ~113s on the previous architecture at High). `Rendering 1/3 → 2/3 → 3/3` (captions burned in) → `Joining with transitions` (**primary xfade path** — output **26.733s** = 9.80s + 17.07s − 0.16s crossfade, so no plain-concat fallback) → `Finishing`. **Caption drift after the transition is gone:** segment 3's frames start at output 9.64s (xfade offset), and at output **10.05s** the karaoke fill sits exactly on the "be"/"three" boundary — predicted 10.02s, i.e. within one 30fps frame. 10.7s further on, at output **20.38s**, the fill is on "shopping" ("the whole ***shopping*** paradise with a"), again matching the frame to ~0.03s. On the old joined-timeline burn both would have lit **0.16s late**. |
+| Clips + captions (in-render burn) | test-speech-30s.mp4, clips 1+2 selected, Original/Standard/**Karaoke** | PASS — `…-clip-01.mp4` + `…-clip-02.mp4`, one render each, **no second caption pass**. Frame-checked: clip 1 @2.0s "They can break the whole outdoor", clip 2 @2.5s "The tangling, orchard," — both karaoke-filled. `exportJob.error` null. |
+| Captions off — fast path | test-speech-30s.mp4, 3 kept segments, no transitions, preset `none`, Combined/Standard | PASS — plan captured from the production bundle by hooking `Worker.postMessage`: **`fonts: []`, no segment carries an `ass` file, and no `ass=` appears in any segment's `-vf`**. Stage trace: `Preparing 0.0s → Rendering 1/3 → 2/3 (3.1s) → 3/3 (6.9s) → Freeing memory (18.0s) → Joining segments (18.1s) → Finishing (18.2s)`, done at **18.2s** — the concat stream copy really is the last step (~0.1s) and there is no caption stage at all. |
 | Cancel | mid-render cancel of the 2-min/8-segment export | PASS — clicked "Cancel export" at ~7s (`Rendering segment 1/8`); returned to Export Studio, progress cleared, title reset, **no error card** (a cancel is not a failure). |
 | Export failure surface | injected step-failure message | PASS — the "Export failed" card still renders the full FFmpeg message *and* the appended log tail verbatim; error reporting was not regressed by the engine change. |
-| Per-pass encode args | all 3 quality tiers × captions on/off × transitions on/off, captured from the real production bundle by hooking `Worker.postMessage` | PASS — Standard: `veryfast`/23 on every pass (**byte-identical to the pre-fix args**, which is why the 30-minute Standard measurement below still stands). High: `veryfast`/19 on every pass (was `medium`/19). Source: intermediates `veryfast`/17, **final pass `fast`/17** — and when captions are off with no transitions the segments *are* the deliverable, so they correctly get `fast`/17; add a transition and the segments drop to `veryfast`/17 while the join takes `fast`/17. The intermediate-vs-final split resolves correctly in every combination. |
+| Per-pass encode args | all 3 quality tiers × captions on/off × transitions on/off, captured from the real production bundle by hooking `Worker.postMessage` | PASS — Standard: `veryfast`/23 on every pass (**byte-identical to the pre-fix args**, which is why the 30-minute Standard measurement below still stands). High: `veryfast`/19 on every pass (was `medium`/19). Source: `fast`/17 on the deliverable pass, `veryfast`/17 on intermediates. Since captions burn in-render, **captions no longer make the segment renders intermediate** — only transitions do (the xfade join re-encodes). Verified on the captioned/no-transition runs above: `segmentEncode == joinEncode == encode` (`veryfast`/23 at Standard). |
 | Clips | 2 clips selected, Original/Standard | PASS — `…-clip-01.mp4` (0.50 MB) + `…-clip-02.mp4` (0.53 MB); "Download all (ZIP)" click threw no error, `exportJob.error` null |
 | Speed remap | 1.5×, Combined/Original/no captions | PASS — output audio duration **20.04s** vs expected `30.066 / 1.5 = 20.04s` (probed via `decodeAudioData`) |
-| Long combined (memory) | test-30min.mp4 (573 MB), Combined/Original/Standard/Clean, 115 active cuts → **116 segments** | PASS — full render (4 instance recycles) → join → caption burn → `test-30min-sharpcut.mp4` (**62.1 MB, 1684.9s, 1280×720**, decodes clean). ~40 min wall-clock (~20 min render, ~19 min burn). Previously OOM'd mid-render (`RuntimeError: memory access out of bounds` ~segment 40); fixed by evicting rendered segments to the JS heap + recreating the FFmpeg instance every 25 segments to reset `ffmpeg.wasm`'s per-`exec()` heap leak. **Not re-run after the encode-speed fix, deliberately:** that run used Standard quality, whose per-pass FFmpeg arguments are byte-identical before and after (verified in the row above), so the encode work cannot have changed it either way. The only difference is that it no longer wastes ~65s attempting the multithreaded core first. Intermediate CRF was intentionally left at the tier value precisely so intermediate segment sizes — which sit in memory for the whole render — could not grow and put this memory ceiling at risk. |
+| Long combined (memory) | test-30min.mp4 (573 MB), Combined/Original/Standard/Clean, 115 active cuts → **116 segments** | PASS — full render (4 instance recycles) → join → caption burn → `test-30min-sharpcut.mp4` (**62.1 MB, 1684.9s, 1280×720**, decodes clean). ~40 min wall-clock (~20 min render, ~19 min burn). **Measured on the previous architecture and not re-run since captions moved in-render** — the ~19 min burn pass no longer exists, so this is now a pessimistic bound; the memory model it validates (segment eviction + instance recycling) is unchanged, and per-segment ASS files are a few KB each. Previously OOM'd mid-render (`RuntimeError: memory access out of bounds` ~segment 40); fixed by evicting rendered segments to the JS heap + recreating the FFmpeg instance every 25 segments to reset `ffmpeg.wasm`'s per-`exec()` heap leak. **Not re-run after the encode-speed fix, deliberately:** that run used Standard quality, whose per-pass FFmpeg arguments are byte-identical before and after (verified in the row above), so the encode work cannot have changed it either way. The only difference is that it no longer wastes ~65s attempting the multithreaded core first. Intermediate CRF was intentionally left at the tier value precisely so intermediate segment sizes — which sit in memory for the whole render — could not grow and put this memory ceiling at risk. |
 
 ### Known environment notes / limitations found
 

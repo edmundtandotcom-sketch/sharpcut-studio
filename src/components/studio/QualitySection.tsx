@@ -4,8 +4,8 @@ import type { Quality } from '../../types';
 import { Section, SelectCard } from './settingsPrimitives';
 
 const OPTIONS: { id: Quality; label: string; blurb: string }[] = [
-  { id: 'standard', label: 'Standard', blurb: 'Smaller files, fast export. Good for drafts.' },
-  { id: 'high', label: 'High', blurb: 'Crisp output for Reels and YouTube. Recommended.' },
+  { id: 'standard', label: 'Standard', blurb: 'Great for Reels and YouTube. Fast. Recommended.' },
+  { id: 'high', label: 'High', blurb: 'Extra crispness, slower export.' },
   { id: 'source', label: 'Source-conscious', blurb: 'Preserve source detail. Largest files.' },
 ];
 
