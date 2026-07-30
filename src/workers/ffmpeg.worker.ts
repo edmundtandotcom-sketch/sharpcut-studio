@@ -5,10 +5,10 @@
 //   run:  { id, kind:'run', type:'export-combined'|'export-clips', payload:{plan,file} }
 //   out:  { id, kind:'progress', stage, pct } | { id, kind:'result', payload } | { id, kind:'error', message }
 //
-// FFmpeg is lazy-loaded on first export: multithreaded @ffmpeg/core-mt when
-// SharedArrayBuffer is available (needs COOP/COEP), else single-thread
-// @ffmpeg/core with a "slower" note. Core assets are self-hosted (Vite ?url
-// imports) — no CDN.
+// FFmpeg is lazy-loaded on first export. SINGLE-THREAD (@ffmpeg/core) is the
+// default and only engine — see the "Engine selection" note below for why the
+// multithreaded core is no longer trusted. Core assets are self-hosted (Vite
+// ?url imports) — no CDN.
 //
 // Same worker-scope casting trick as transcribe.worker.ts to avoid pulling the
 // webworker lib into the DOM tsconfig.
@@ -56,13 +56,39 @@ let cancelled = false;
 const fsFiles = new Set<string>();
 let fontsDirMade = false;
 
+// ---- Engine selection -----------------------------------------------------
+// SINGLE-THREAD IS THE DEFAULT. The multithreaded core (@ffmpeg/core-mt) is
+// nominally faster but proved unreliable in real deployed conditions, in two
+// distinct ways:
+//
+//   1. It can DEADLOCK inside exec() on a heavy filtergraph — no progress
+//      events, no log lines, no return, forever. The activity watchdog below
+//      was built for this case and does catch it.
+//   2. Worse, and what actually burned a real user: it can CRAWL. Reproduced
+//      on testdata/test-2min.mp4 (8 segments, Clean captions, High quality):
+//      3.68% at 12s elapsed, still 3.68% at 36s, 3.88% at 58s. It never went
+//      silent, so the activity watchdog NEVER FIRED — the export would have
+//      run for hours. The user report ("more than 10 minutes and only at 24%")
+//      matches this signature exactly.
+//
+// Case 2 has no signal that cleanly separates it from a legitimately slow but
+// working encode (Source quality on a large video is genuinely slow, and a
+// throughput threshold tight enough to catch a crawl would false-positive on
+// that and abandon a run that was going to finish). Rather than ship a tuned
+// guess, we stop attempting MT at all: the single-thread core is slower in
+// theory but empirically FINISHES, predictably, with clean errors when it
+// fails. Part B of this fix (much faster x264 presets + no wasteful
+// double-encoding of intermediates) recovers the throughput MT was supposed to
+// provide, without the failure mode.
+//
+// Flip MT_ENABLED to true to re-test the multithreaded core; everything below
+// (watchdog, session-sticky verdict, one-shot ST restart) still works.
+const MT_ENABLED: boolean = false;
+
 // ---- Hang watchdog --------------------------------------------------------
-// The multithreaded core (@ffmpeg/core-mt) can DEADLOCK inside exec() on a bad
-// filtergraph: no progress events, no log lines, no return — forever. The
-// single-thread core fails cleanly (returns code 1) instead. So we run MT first
-// for speed, but guard every exec with an activity watchdog. If an exec emits
-// neither a 'progress' event nor a log line for HANG_MS, we treat the instance
-// as hung, terminate it, and restart the whole job single-thread (once).
+// Guards every exec against a TOTAL stall (no progress event and no log line
+// for HANG_MS). Kept even on single-thread: it turns an unrecoverable wedge
+// into an honest error instead of an infinite spinner.
 const HANG_MS = 45_000;
 const WATCHDOG_TICK_MS = 5_000;
 // Updated by BOTH the log and progress handlers in makeInstance(); the watchdog
@@ -70,6 +96,7 @@ const WATCHDOG_TICK_MS = 5_000;
 let lastActivityAt = 0;
 // Session-sticky verdict: once MT has hung, every later export goes straight to
 // single-thread. Persists for the life of the worker (i.e. the browser tab).
+// Only reachable when MT_ENABLED is true.
 let mtHungOnce = false;
 
 /** Thrown when the watchdog trips; distinguishes a hang from a clean failure. */
@@ -212,9 +239,10 @@ async function makeInstance(threaded: boolean): Promise<unknown> {
 
 async function ensureLoaded(): Promise<void> {
   if (ffmpeg) return;
-  // Multithreaded first for speed — but only if SharedArrayBuffer exists AND MT
-  // hasn't already hung this session. Once it hangs, we never trust it again.
-  const hasSAB = typeof SharedArrayBuffer !== 'undefined';
+  // Single-thread is the default engine (see the Engine selection note). MT is
+  // only ever attempted when explicitly re-enabled, SharedArrayBuffer exists,
+  // and MT hasn't already hung this session.
+  const hasSAB = MT_ENABLED && typeof SharedArrayBuffer !== 'undefined';
   if (hasSAB && !mtHungOnce) {
     try {
       ffmpeg = await makeInstance(true);
@@ -331,9 +359,9 @@ async function step(label: string, units: number, args: string[]): Promise<void>
 function segmentRenderArgs(spec: SegmentSpec, plan: ExportPlan): string[] {
   const args = ['-ss', String(r(spec.srcStart)), '-i', 'input', '-t', String(r(spec.srcDuration)), '-vf', spec.vf];
   if (plan.hasAudio) {
-    args.push('-af', spec.af, ...plan.encode);
+    args.push('-af', spec.af, ...plan.segmentEncode);
   } else {
-    args.push('-an', ...plan.videoEncode, '-movflags', '+faststart');
+    args.push('-an', ...plan.segmentVideoEncode, '-movflags', '+faststart');
   }
   args.push(spec.outName);
   return args;
@@ -469,8 +497,8 @@ async function joinWithTransitions(plan: CombinedPlan): Promise<void> {
   const attempt = async (useFallback: boolean): Promise<void> => {
     const { graph, vOut, aOut } = buildXfadeGraph(runDurations, plan.xfades, plan.hasAudio, useFallback);
     const args = [...inputs, '-filter_complex', graph, '-map', vOut];
-    if (plan.hasAudio) args.push('-map', aOut, ...plan.encode);
-    else args.push('-an', ...plan.videoEncode, '-movflags', '+faststart');
+    if (plan.hasAudio) args.push('-map', aOut, ...plan.joinEncode);
+    else args.push('-an', ...plan.joinVideoEncode, '-movflags', '+faststart');
     args.push('joined.mp4');
     await step(useFallback ? 'Joining segments (safe mode)' : 'Joining with transitions', runFiles.length, args);
   };
@@ -511,7 +539,7 @@ async function runCombined(id: string, plan: CombinedPlan, file: File): Promise<
   doneUnits = 0;
   vault = [];
 
-  curLabel = usingThreads ? 'Preparing' : 'Preparing — single-thread mode (slower)';
+  curLabel = 'Preparing';
   emit(0);
   await writeInput(file);
   await writeFonts(plan);
@@ -584,7 +612,7 @@ async function runClips(id: string, plan: ClipsPlan, file: File): Promise<void> 
   totalUnits = 0.5 + M * (1 + (plan.fonts.length ? 0.6 : 0));
   doneUnits = 0;
 
-  curLabel = usingThreads ? 'Preparing' : 'Preparing — single-thread mode (slower)';
+  curLabel = 'Preparing';
   emit(0);
   await writeInput(file);
   await writeFonts(plan);
@@ -675,7 +703,7 @@ async function probeHasAudioStream(): Promise<boolean> {
  */
 async function runExtractAudio(id: string, payload: ExtractAudioRunMessage['payload']): Promise<void> {
   const { file, chunkS, overlapS, duration } = payload;
-  curLabel = usingThreads ? 'Extracting audio' : 'Extracting audio — single-thread mode (slower)';
+  curLabel = 'Extracting audio';
   emit(0);
   await writeInput(file);
 

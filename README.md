@@ -43,14 +43,17 @@ backend, no account, and no upload of your video anywhere.
 |---|---|
 | Chrome (desktop) | **Primary** — fully supported and the target for all testing. |
 | Edge (desktop) | **Primary** — Chromium-based, same support as Chrome. |
-| Firefox (desktop) | Best-effort. Core editing works; multithreaded FFmpeg export may fall back to a slower single-thread path. |
+| Firefox (desktop) | Best-effort. Core editing works; export uses the same single-thread FFmpeg core as Chrome. |
 | Safari (desktop/iOS) | Best-effort, untested. WebAssembly/SharedArrayBuffer support varies by version. |
 | Mobile browsers | Not a target. The layout is responsive down to 375px, but video analysis/export are heavy workloads better suited to a laptop/desktop. |
 
-SharpCut Studio requires WebAssembly, Web Workers, and (for the fastest export
-path) `SharedArrayBuffer` behind cross-origin isolation headers (see
+SharpCut Studio requires WebAssembly, Web Workers, and `SharedArrayBuffer`
+behind cross-origin isolation headers (see
 [Deployment](#deployment-cloudflare-pages)). Unsupported browsers get an
-in-app warning banner rather than a silent failure.
+in-app warning banner rather than a silent failure. Note that FFmpeg export
+itself is single-threaded on purpose (see
+[Known limitations](#known-limitations)) — the isolation requirement is for
+the feature gate and the Whisper/ONNX threaded runtime.
 
 ## Privacy
 
@@ -104,9 +107,11 @@ file host that supports the required headers below. As of this build:
 
 - Total size: **~90 MB**.
 - Largest assets, all cached long-term by the browser after first load:
-  - `ffmpeg/core-mt/ffmpeg-core.wasm` — ~31 MB (multithreaded FFmpeg, used
-    when cross-origin isolation is active)
-  - `ffmpeg/core/ffmpeg-core.wasm` — ~31 MB (single-thread fallback)
+  - `ffmpeg/core/ffmpeg-core.wasm` — ~31 MB (single-thread FFmpeg — the core
+    every export actually uses)
+  - `ffmpeg/core-mt/ffmpeg-core.wasm` — ~31 MB (multithreaded FFmpeg, shipped
+    but **not used**: `MT_ENABLED` is off, see
+    [Known limitations](#known-limitations))
   - `assets/ort-wasm-simd-threaded.*.wasm` — ~21 MB (ONNX Runtime, powers the
     Whisper transcription worker)
   - `fonts/*.ttf` — self-hosted caption fonts baked into the FFmpeg filesystem
@@ -144,10 +149,11 @@ Pages project; subsequent deploys just reuse it.
 ```
 
 These enable cross-origin isolation, which is required for
-`SharedArrayBuffer` and therefore for the multithreaded FFmpeg export path
-(`@ffmpeg/core-mt`). Without them the app still works, but export falls back
-to the slower single-threaded FFmpeg core. Cloudflare Pages applies
-`_headers` automatically — no dashboard configuration needed.
+`SharedArrayBuffer`. The app's support gate checks for it, and the
+Whisper/ONNX transcription runtime uses it; FFmpeg export deliberately does
+not (it runs single-threaded — see
+[Known limitations](#known-limitations)). Cloudflare Pages applies `_headers`
+automatically — no dashboard configuration needed.
 
 ### Custom domain
 
@@ -182,7 +188,9 @@ build is served; no user data is stored server-side to migrate or lose.
   file; the full run took ~40 minutes in-browser (~20 min rendering, ~19 min
   caption burn). Longer/larger videos may simply run slowly; analysis
   checkpoints to IndexedDB so an interrupted long run can resume instead of
-  restarting.
+  restarting. (Standard quality's FFmpeg arguments were not changed by the
+  encode-speed work below, so that measurement still stands — see the test
+  report.)
 - **WASM memory ceiling:** the FFmpeg WebAssembly heap is capped around 2 GB
   (and the multithreaded core's SharedArrayBuffer cannot grow past its build-
   time maximum). Two things make long combined exports fit: (1) each rendered
@@ -194,21 +202,53 @@ build is served; no user data is stored server-side to migrate or lose.
   are written back at join time. If an export still exhausts memory, the failure
   message says so and suggests Individual clips mode, Standard quality, or a
   shorter video; the app also warns before starting a high-risk export.
-- **Single-thread fallback is slower:** without cross-origin isolation (COOP/
-  COEP) headers, FFmpeg export runs single-threaded and takes noticeably
-  longer (measured ~3× slower than the multithreaded core on the same clip).
-  Always deploy with `_headers` in place.
-- **Multithreaded export has a hang watchdog:** the multithreaded FFmpeg core
-  (`@ffmpeg/core-mt`) can, in some environments, deadlock silently inside an
-  `exec()` on a heavy filtergraph — no progress, no logs, no return. Exports
-  therefore start on the multithreaded core (for speed) but guard every
-  `exec()` with a 45-second activity watchdog. If an `exec()` produces neither a
-  progress event nor a log line for 45s, the worker terminates that core,
-  reloads the single-thread core, and automatically restarts the whole export
-  from the beginning (surfacing a "Restarting in single-thread mode…" stage).
-  After the first such hang, every later export in the session goes straight to
-  single-thread. Net effect: multithreaded speed when it works, guaranteed
-  single-thread completion when it does not — never an invisible hang.
+- **Export runs single-threaded, on purpose:** the multithreaded FFmpeg core
+  (`@ffmpeg/core-mt`) is nominally faster but proved unreliable in real
+  deployed conditions, in two different ways:
+  1. It can **deadlock** silently inside an `exec()` on a heavy filtergraph —
+     no progress, no logs, no return. The 45-second activity watchdog (below)
+     was built for this and does catch it.
+  2. Worse, it can **crawl**. Reproduced on `testdata/test-2min.mp4` (8
+     segments, Clean captions, High quality): 3.68% at 12s elapsed, still
+     3.68% at 36s, 3.88% at 58s. Because it kept emitting occasional tiny
+     progress ticks it never looked *silent*, so the watchdog never fired and
+     the export would have run for hours. A real user reported exactly this
+     ("more than 10 minutes and only at 24%") on the deployed site.
+
+  A crawl has no signal that separates it from a legitimately slow but working
+  encode (Source quality on a large video is genuinely slow), so any throughput
+  threshold tight enough to catch it would eventually abandon runs that were
+  going to finish. So the worker no longer attempts the multithreaded core at
+  all — `MT_ENABLED` in `src/workers/ffmpeg.worker.ts` is `false`. Single-thread
+  is slower per frame in theory but empirically *finishes*, predictably, and
+  fails with a clean exit code instead of hanging. Progress labels no longer
+  call it a degraded "single-thread mode (slower)" fallback, because it is now
+  the normal path.
+
+  The COOP/COEP headers are still required (and still deployed) — the feature
+  gate and the Whisper/ONNX threading path depend on cross-origin isolation.
+- **Hang watchdog is still armed:** every `exec()` is raced against a
+  45-second *activity* watchdog (no progress event and no log line). It now
+  guards the single-thread core, turning an unrecoverable wedge into an honest
+  "Export stalled and could not recover" error rather than an infinite spinner.
+- **Encode presets are deliberately fast:** libx264 compiled to WebAssembly
+  costs far more for the slower x264 presets than a native build does, while
+  buying the same marginal fidelity. Quality tiers therefore differentiate on
+  **CRF**, not preset: Standard = CRF 23 `veryfast`, High = CRF 19 `veryfast`,
+  Source-conscious = CRF 17 `fast`. High and Source used to use `medium`, which
+  is what made a 2-minute clip take ~7½ minutes. Additionally, only the pass
+  that produces the deliverable pays for the chosen preset — segment renders
+  (and the xfade join when a caption burn follows) are intermediates that get
+  re-encoded and deleted, so they always use the cheapest preset. This tool
+  targets Reels/YouTube, not archival mastering.
+- **The caption burn is now the dominant cost:** when captions are on, the
+  export re-encodes the *entire* joined output once more through libass. On the
+  2-minute fixture that pass is roughly half the total wall-clock. Turning
+  captions off skips the pass entirely (there is a real "no caption pass" path,
+  not a no-op filter). Burning captions per-segment during the render — which
+  would remove the second full-length encode altogether — is the obvious next
+  optimisation, but it needs caption cues rebased per segment and was left out
+  of scope.
 - **Caption timing after transitions:** each transition trims a small overlap
   (its crossfade duration) out of the final timeline. Caption sync accounts
   for cuts and speed changes exactly, but very transition-heavy edits can
@@ -219,8 +259,9 @@ build is served; no user data is stored server-side to migrate or lose.
   (captions, crop, zoom, transitions) is a close CSS/canvas approximation for
   responsiveness. The exported MP4, rendered by FFmpeg with the same
   deterministic filter graph, is the source of truth for the final look.
-- **Safari:** not actively tested. WebAssembly/threading support varies by
-  Safari version; expect the single-thread fallback path at best.
+- **Safari:** not actively tested. WebAssembly/`SharedArrayBuffer` support
+  varies by Safari version, and the support gate requires cross-origin
+  isolation.
 - **No accounts, no cloud sync:** by design. Project recovery is local to one
   browser profile on one device; use "Save project file" to move a project
   between devices/browsers.
@@ -286,17 +327,21 @@ plus local FFmpeg CLI cross-checks where noted.
 ### Export engine (FFmpeg worker)
 
 All export runs below completed against `testdata/` on the production build.
-The multithreaded core hung inside the first segment `exec()` (no progress/log
-for 45s); the watchdog fired, reloaded single-thread, and auto-restarted the
-job, which then completed — exactly the designed behaviour.
+Exports now go straight to the single-thread core by design (see
+[Known limitations](#known-limitations)); progress labels no
+longer mention threads at all.
 
 | Export | Settings | Result |
 |---|---|---|
-| Combined + captions | test-speech-30s.mp4, Combined/Original/1×/Clean/High | PASS — MT started (no ST label), hung inside render, watchdog fired at ~53s → "Restarting in single-thread mode…" → ST reload → render/join/**burn captions** → `test-speech-30s-sharpcut.mp4` (1.63 MB). ST portion ≈86s (≈ the ~90s baseline). MT auto-disabled for the rest of the session. |
-| Transitions | manual cut → 2 kept segments, Quick Fade @ boundary, Combined/Original/Standard | PASS — went straight to single-thread (MT already disabled), `Rendering 1/2 → 2/2 → Joining with transitions` (**primary xfade path**, no safe-mode/plain-concat fallback) → captions → `…-sharpcut.mp4` (1.01 MB). No xfade error surfaced. First real exercise of the transitions path. |
+| **2-minute clip (the reported bug)** | test-2min.mp4 (42 MB, 120.1s), 7 active cuts → **8 segments**, Combined/Original/1×/Clean/**High** | **PASS — and 2.3× faster.** `Rendering segment 1/8 … 8/8` done at ~100s → join at ~100s → caption burn → complete at **197.9s (3m18s)**. Output `test-2min-sharpcut.mp4`: **5.04 MB, 115.84s, 1280×720**, h264 + AAC 48 kHz stereo, captions burned and legible (frame-checked at 33s and 72s against a screen-share source, the worst case for a fast preset). Before this fix: multithreaded core **crawled** (3.68% at 12s, 3.88% at 58s, watchdog never fired — effectively never finishing), and with MT forced off the same export took **~450–470s (7½–8 min)** for a 5.77 MB output. |
+| Combined + captions | test-speech-30s.mp4, Combined/Original/1×/Clean/High | PASS — **~44s to 100%, complete by ~50s** (`test-speech-30s-sharpcut.mp4`, **1.27 MB, 29.87s, 1280×720**, captions burned, frame-checked at 2s). Previously ~86s of single-thread work *after* ~65s wasted on the MT hang + core reload. |
+| Transitions | test-speech-30s.mp4, 2 kept segments, Quick Fade @ boundary, Combined/Original/**High**/Clean | PASS — `Rendering 1/2 → 2/2 → Joining with transitions` (**primary xfade path**, no safe-mode/plain-concat fallback) → burn captions → complete at **~113s**. Output **1.23 MB, 29.57s** — exactly the 29.87s straight-cut duration minus the 0.3s crossfade trim. Exercises the new `joinEncode` pass (segments intermediate, join intermediate, caption burn final). |
+| Cancel | mid-render cancel of the 2-min/8-segment export | PASS — clicked "Cancel export" at ~7s (`Rendering segment 1/8`); returned to Export Studio, progress cleared, title reset, **no error card** (a cancel is not a failure). |
+| Export failure surface | injected step-failure message | PASS — the "Export failed" card still renders the full FFmpeg message *and* the appended log tail verbatim; error reporting was not regressed by the engine change. |
+| Per-pass encode args | all 3 quality tiers × captions on/off × transitions on/off, captured from the real production bundle by hooking `Worker.postMessage` | PASS — Standard: `veryfast`/23 on every pass (**byte-identical to the pre-fix args**, which is why the 30-minute Standard measurement below still stands). High: `veryfast`/19 on every pass (was `medium`/19). Source: intermediates `veryfast`/17, **final pass `fast`/17** — and when captions are off with no transitions the segments *are* the deliverable, so they correctly get `fast`/17; add a transition and the segments drop to `veryfast`/17 while the join takes `fast`/17. The intermediate-vs-final split resolves correctly in every combination. |
 | Clips | 2 clips selected, Original/Standard | PASS — `…-clip-01.mp4` (0.50 MB) + `…-clip-02.mp4` (0.53 MB); "Download all (ZIP)" click threw no error, `exportJob.error` null |
 | Speed remap | 1.5×, Combined/Original/no captions | PASS — output audio duration **20.04s** vs expected `30.066 / 1.5 = 20.04s` (probed via `decodeAudioData`) |
-| Long combined (memory) | test-30min.mp4 (573 MB), Combined/Original/Standard/Clean, 115 active cuts → **116 segments** | PASS — full render (4 instance recycles) → join → caption burn → `test-30min-sharpcut.mp4` (**62.1 MB, 1684.9s, 1280×720**, decodes clean). ~40 min wall-clock (~20 min render, ~19 min burn). Previously OOM'd mid-render (`RuntimeError: memory access out of bounds` ~segment 40); fixed by evicting rendered segments to the JS heap + recreating the FFmpeg instance every 25 segments to reset `ffmpeg.wasm`'s per-`exec()` heap leak. |
+| Long combined (memory) | test-30min.mp4 (573 MB), Combined/Original/Standard/Clean, 115 active cuts → **116 segments** | PASS — full render (4 instance recycles) → join → caption burn → `test-30min-sharpcut.mp4` (**62.1 MB, 1684.9s, 1280×720**, decodes clean). ~40 min wall-clock (~20 min render, ~19 min burn). Previously OOM'd mid-render (`RuntimeError: memory access out of bounds` ~segment 40); fixed by evicting rendered segments to the JS heap + recreating the FFmpeg instance every 25 segments to reset `ffmpeg.wasm`'s per-`exec()` heap leak. **Not re-run after the encode-speed fix, deliberately:** that run used Standard quality, whose per-pass FFmpeg arguments are byte-identical before and after (verified in the row above), so the encode work cannot have changed it either way. The only difference is that it no longer wastes ~65s attempting the multithreaded core first. Intermediate CRF was intentionally left at the tier value precisely so intermediate segment sizes — which sit in memory for the whole render — could not grow and put this memory ceiling at risk. |
 
 ### Known environment notes / limitations found
 
@@ -308,7 +353,13 @@ job, which then completed — exactly the designed behaviour.
   corrupt file, which fails fast enough to be unaffected). This is a test-harness
   constraint, not an app defect — the corrupt-file path was still confirmed
   end-to-end through the real UI.
-- Single-thread export in this hidden/throttled tab ran markedly slower than a
-  foregrounded tab; the ~86s single-thread figure above is consistent with the
-  ~90s foregrounded baseline once the multithreaded hang + core reload
-  (~45s + ~22s) are excluded.
+- Export timings were measured in this hidden/throttled tab, where Chrome
+  throttles worker scheduling, so a foregrounded tab should be equal or
+  faster. Crucially the before/after 2-minute figures (~450–470s → 197.9s)
+  were measured under the **same** harness conditions, so the ~2.3× is a
+  like-for-like comparison, not a measurement artefact.
+- **Not verified:** the 30-minute combined export was not re-run (see the note
+  in its row). The multithreaded core's crawl was reproduced but no attempt
+  was made to find machines/inputs where MT behaves well — the decision to
+  disable it is based on it failing in the environments actually observed,
+  including a real user's deployed session.

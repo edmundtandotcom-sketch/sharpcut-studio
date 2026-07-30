@@ -53,11 +53,28 @@ export interface XfadeStep {
   durationS: number;
 }
 
+// Per-pass encode args. The export is a CHAIN of encodes — combined:
+// segment renders -> [xfade join] -> [caption burn]; clips: clip render ->
+// [caption burn] — and only the LAST pass in the chain produces the file the
+// user keeps. Every pass upstream of it is an intermediate that gets re-encoded
+// and deleted, so it must not pay for the user's chosen x264 preset. The plan
+// (which knows whether captions/transitions are on) resolves that here; the
+// worker just uses the field named after the pass it is running.
 interface PlanBase {
   width: number;
   height: number;
-  encode: string[]; // combined (video+audio) encode args for segment render
-  videoEncode: string[]; // video-only encode args for the caption pass
+  /** FINAL-pass (video+audio) encode args. */
+  encode: string[];
+  /** FINAL-pass video-only encode args — used by the caption burn. */
+  videoEncode: string[];
+  /** Segment / clip render pass (video+audio). */
+  segmentEncode: string[];
+  /** Segment / clip render pass, video-only (silent sources). */
+  segmentVideoEncode: string[];
+  /** xfade join pass (video+audio); combined-with-transitions only. */
+  joinEncode: string[];
+  /** xfade join pass, video-only. */
+  joinVideoEncode: string[];
   fonts: FontAsset[]; // fonts to write into FFmpeg FS /fonts (0 or 1)
   hasAudio: boolean;
 }
@@ -153,18 +170,37 @@ function makeSegmentSpec(
 /** Build the complete, deterministic export plan. */
 export function buildExportPlan(input: BuildPlanInput): ExportPlan {
   const dims = outputDims(input.format, input.srcWidth, input.srcHeight);
-  const encode = encodeArgs(input.quality);
-  const videoEncode = videoEncodeArgs(input.quality);
   const captionsOn = input.caption.preset !== 'none';
   const fonts: FontAsset[] = captionsOn ? [fontAssetFor(input.caption.font)] : [];
   const assFamily = fonts[0]?.assFamily ?? 'Inter';
   const speed = input.speed > 0 ? input.speed : 1;
 
+  // Transition map is needed up front: it decides whether the segment renders
+  // are intermediates (a later xfade join re-encodes them) or the final pass.
+  const trByBoundary = new Map<number, TransitionPoint>();
+  if (input.mode === 'combined') {
+    for (const t of input.transitions) {
+      if (t.type === 'none') continue;
+      if (t.boundaryIndex >= 0 && t.boundaryIndex <= input.segments.length - 2) {
+        trByBoundary.set(t.boundaryIndex, t);
+      }
+    }
+  }
+  const hasTransitions = trByBoundary.size > 0;
+
+  // A pass is intermediate when something downstream re-encodes its output.
+  const segmentsAreIntermediate = captionsOn || hasTransitions;
+
   const base: PlanBase = {
     width: dims.w,
     height: dims.h,
-    encode,
-    videoEncode,
+    encode: encodeArgs(input.quality),
+    videoEncode: videoEncodeArgs(input.quality),
+    segmentEncode: encodeArgs(input.quality, segmentsAreIntermediate),
+    segmentVideoEncode: videoEncodeArgs(input.quality, segmentsAreIntermediate),
+    // The join is final unless a caption burn follows it.
+    joinEncode: encodeArgs(input.quality, captionsOn),
+    joinVideoEncode: videoEncodeArgs(input.quality, captionsOn),
     fonts,
     hasAudio: input.hasAudio,
   };
@@ -195,15 +231,9 @@ export function buildExportPlan(input: BuildPlanInput): ExportPlan {
   }
 
   // ---- Combined -----------------------------------------------------------
+  // (trByBoundary / hasTransitions were resolved above — they feed the
+  // intermediate-vs-final encode decision.)
   const segs = input.segments;
-  const trByBoundary = new Map<number, TransitionPoint>();
-  for (const t of input.transitions) {
-    if (t.type === 'none') continue;
-    if (t.boundaryIndex >= 0 && t.boundaryIndex <= segs.length - 2) {
-      trByBoundary.set(t.boundaryIndex, t);
-    }
-  }
-  const hasTransitions = trByBoundary.size > 0;
 
   const segments: SegmentSpec[] = segs.map((seg, i) =>
     makeSegmentSpec(seg, `seg${pad(i, 3)}.mp4`, input, dims, hasTransitions),

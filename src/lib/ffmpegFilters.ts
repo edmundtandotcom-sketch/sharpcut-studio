@@ -183,15 +183,45 @@ export function segmentAudioFilter(speed: number): string {
 // Encoding args per quality tier.
 // ---------------------------------------------------------------------------
 
+// Quality tiers. CRF carries the quality differentiation between tiers; the
+// x264 *preset* is deliberately kept fast across all of them.
+//
+// Why: this encoder is libx264 compiled to WebAssembly with no SIMD-wide native
+// tuning, so the slower presets cost far more here than they do natively while
+// buying the same marginal fidelity. `high` and `source` used to use `medium`,
+// which made a 2-minute clip (8 segments + a full-length caption burn) take
+// ~7-8 minutes in-browser — a real user reported exactly that pain. x264
+// `veryfast` is typically 3-4× faster than `medium` at the same CRF for a
+// modest size increase and a difference that is essentially invisible at these
+// CRF levels on Reels/YouTube-bound footage (this tool is not an archival
+// mastering path). `source` keeps one step of extra effort (`fast`) so the
+// top tier still means something beyond its lower CRF.
 const QUALITY: Record<Quality, { crf: number; preset: string }> = {
   standard: { crf: 23, preset: 'veryfast' },
-  high: { crf: 19, preset: 'medium' },
-  source: { crf: 17, preset: 'medium' },
+  high: { crf: 19, preset: 'veryfast' },
+  source: { crf: 17, preset: 'fast' },
 };
 
-/** libx264 + AAC encode args for a quality tier. */
-export function encodeArgs(quality: Quality): string[] {
+// Preset for INTERMEDIATE passes — output that a later pass re-encodes and then
+// throws away (segment renders before a caption burn, and the xfade join when a
+// caption burn follows). The user's chosen preset buys nothing on a file that is
+// about to be re-encoded, so intermediates always use the cheapest preset.
+// CRF is deliberately left at the tier value: intermediate segments are held in
+// memory for the whole render, so growing them (a lower CRF) would trade encode
+// time for memory-ceiling risk on long videos.
+const INTERMEDIATE_PRESET = 'veryfast';
+
+function presetFor(quality: Quality, intermediate: boolean): { crf: number; preset: string } {
   const q = QUALITY[quality] ?? QUALITY.high;
+  return intermediate ? { crf: q.crf, preset: INTERMEDIATE_PRESET } : q;
+}
+
+/**
+ * libx264 + AAC encode args for a quality tier. Pass `intermediate` when the
+ * output of this pass is re-encoded by a later pass (see INTERMEDIATE_PRESET).
+ */
+export function encodeArgs(quality: Quality, intermediate = false): string[] {
+  const q = presetFor(quality, intermediate);
   return [
     '-c:v',
     'libx264',
@@ -211,8 +241,8 @@ export function encodeArgs(quality: Quality): string[] {
 }
 
 /** Video-only encode args (audio handled separately), for the caption pass. */
-export function videoEncodeArgs(quality: Quality): string[] {
-  const q = QUALITY[quality] ?? QUALITY.high;
+export function videoEncodeArgs(quality: Quality, intermediate = false): string[] {
+  const q = presetFor(quality, intermediate);
   return [
     '-c:v',
     'libx264',
