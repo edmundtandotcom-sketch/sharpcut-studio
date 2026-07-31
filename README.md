@@ -30,6 +30,10 @@ backend, no account, and no upload of your video anywhere.
   - Suggested and manual scene transitions, and quick zoom/punch-in effects.
   - Three export quality tiers (Standard — the recommended default — / High /
     Source-conscious).
+  - Thumbnail selector: scrub any frame from the original source video
+    (cuts included) or upload a JPG/PNG, then download it as a JPEG rendered
+    at the exact export geometry (format, crop, dimensions) alongside the
+    video on the complete screen.
 - **Local project recovery**: your edit decisions, transcript, captions, and
   studio settings autosave to IndexedDB as you work, and can also be saved to
   (and reopened from) a portable `sharpcut-project.json` file. See

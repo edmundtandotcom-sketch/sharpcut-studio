@@ -14,6 +14,7 @@ import { CaptionEditorSection } from './CaptionEditorSection';
 import { TransitionsSection } from './TransitionsSection';
 import { ZoomSection } from './ZoomSection';
 import { QualitySection } from './QualitySection';
+import { ThumbnailSection } from './ThumbnailSection';
 import { SummaryBar } from './SummaryBar';
 import { usePreviewController, type PreviewActions } from './usePreviewController';
 
@@ -163,6 +164,7 @@ export function StudioScreen() {
             <TransitionsSection controller={actions} segments={segments} speed={speed} />
             <ZoomSection controller={actions} segments={segments} speed={speed} />
             <QualitySection />
+            <ThumbnailSection />
           </div>
           <SummaryBar segments={segments} speed={speed} />
         </div>

@@ -104,6 +104,14 @@ export function isValidSnapshot(obj: unknown): obj is ProjectSnapshotV1 {
   const o = obj as Record<string, unknown>;
   const fp = o.fingerprint as Record<string, unknown> | undefined;
   const meta = o.projectMeta as Record<string, unknown> | undefined;
+  // Additive, optional field — absent (snapshots saved before it existed) or
+  // explicit null both mean "no thumbnail"; when present it must be well-formed.
+  const thumb = o.thumbnail as Record<string, unknown> | null | undefined;
+  const thumbOk =
+    thumb === undefined ||
+    thumb === null ||
+    (thumb.kind === 'frame' && typeof thumb.timeSource === 'number') ||
+    (thumb.kind === 'upload' && typeof thumb.dataUrl === 'string');
   return (
     o.v === 1 &&
     typeof o.savedAt === 'number' &&
@@ -117,6 +125,7 @@ export function isValidSnapshot(obj: unknown): obj is ProjectSnapshotV1 {
     Array.isArray(o.captionBlocks) &&
     Array.isArray(o.cuts) &&
     !!o.studio &&
+    thumbOk &&
     typeof o.appState === 'string'
   );
 }

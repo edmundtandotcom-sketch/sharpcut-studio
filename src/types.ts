@@ -93,10 +93,26 @@ export interface ProjectSnapshotV1 {
   captionBlocks: CaptionBlock[];
   cuts: Cut[];
   studio: StudioSettings;
+  /** Additive (post-v1) — the chosen thumbnail, if any. Optional so snapshots
+   * written before this field existed still validate; absent/undefined reads
+   * as "no thumbnail chosen". An 'upload' whose dataUrl is too large to persist
+   * is dropped to `null` before saving (see buildProjectSnapshot). */
+  thumbnail?: ThumbnailChoice | null;
   /** Stage the user was on when this was saved — resume lands here (or the
    * closest sensible stage) once the video is reselected. */
   appState: AppState;
 }
+
+// ============================================================================
+// Thumbnail selector (Export Studio section 9, additive — NOT part of the
+// locked StudioSettings shape above). Either a pointer at a source-video
+// timestamp (re-rendered at export geometry on demand, so it always matches
+// the current format/crop) or a user-uploaded image (cover-fit at export
+// geometry, no crop position of its own).
+// ============================================================================
+export type ThumbnailChoice =
+  | { kind: 'frame'; timeSource: number } // source seconds — ANY frame, cuts included
+  | { kind: 'upload'; dataUrl: string };
 
 export const DEFAULT_STUDIO_SETTINGS: StudioSettings = {
   mode: 'combined',

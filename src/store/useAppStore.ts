@@ -18,6 +18,7 @@ import {
   type ProjectSnapshotV1,
   type Quality,
   type StudioSettings,
+  type ThumbnailChoice,
   type TransitionPoint,
   type WordStamp,
   type ZoomEffect,
@@ -58,6 +59,10 @@ interface StudioSlice extends StudioSettings {
   setQuality: (quality: Quality) => void;
   toggleClipIndex: (index: number) => void;
   setSelectedClipIndices: (indices: number[]) => void;
+  /** Additive P4 state — NOT part of the locked StudioSettings shape (see
+   * types.ts). The chosen Export Studio thumbnail, or null if none chosen. */
+  thumbnail: ThumbnailChoice | null;
+  setThumbnail: (thumbnail: ThumbnailChoice | null) => void;
 }
 
 interface ExportJobSlice {
@@ -215,6 +220,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   studio: {
     ...DEFAULT_STUDIO_SETTINGS,
+    thumbnail: null,
+    setThumbnail: (thumbnail) => set((s) => ({ studio: { ...s.studio, thumbnail } })),
     setSpeed: (speed) => set((s) => ({ studio: { ...s.studio, speed } })),
     setFormat: (format) => set((s) => ({ studio: { ...s.studio, format } })),
     setCaptionStyle: (partial) =>
@@ -336,7 +343,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
         error: null,
       },
       edits: { ...s.edits, cuts: snapshot.cuts },
-      studio: { ...s.studio, ...snapshot.studio },
+      studio: { ...s.studio, ...snapshot.studio, thumbnail: snapshot.thumbnail ?? null },
       captionEditor: initialCaptionEditor,
       exportJob: initialExportJob,
     }));
@@ -354,12 +361,30 @@ export const useAppStore = create<AppStore>((set, get) => ({
       project: initialProject,
       analysis: initialAnalysis,
       edits: { ...s.edits, cuts: [] },
-      studio: { ...s.studio, ...DEFAULT_STUDIO_SETTINGS },
+      studio: { ...s.studio, ...DEFAULT_STUDIO_SETTINGS, thumbnail: null },
       captionEditor: initialCaptionEditor,
       exportJob: initialExportJob,
     }));
   },
 }));
+
+// A dataURL's raw byte size is ~3/4 of its base64 string length. Cap what an
+// 'upload' thumbnail contributes to the recovery snapshot/project file at 2MB
+// so a large image doesn't bloat every autosave — the in-session choice is
+// untouched, only the persisted copy (and therefore recovery) drops it.
+const THUMBNAIL_UPLOAD_SNAPSHOT_CAP_BYTES = 2 * 1024 * 1024;
+
+function snapshotThumbnail(t: ThumbnailChoice | null): ThumbnailChoice | null {
+  if (!t) return null;
+  if (t.kind === 'frame') return t;
+  const approxBytes = Math.ceil((t.dataUrl.length * 3) / 4);
+  if (approxBytes > THUMBNAIL_UPLOAD_SNAPSHOT_CAP_BYTES) {
+    // eslint-disable-next-line no-console
+    console.warn('SharpCut: uploaded thumbnail too large to persist in the recovery snapshot (>2MB); dropped from autosave/project file only.');
+    return null;
+  }
+  return t;
+}
 
 /**
  * Build a P6 project snapshot from the current store state — used by both the
@@ -394,6 +419,7 @@ export function buildProjectSnapshot(state: AppStore): ProjectSnapshotV1 | null 
       crop: studio.crop,
       quality: studio.quality,
     },
+    thumbnail: snapshotThumbnail(studio.thumbnail),
     appState: state.appState,
   };
 }

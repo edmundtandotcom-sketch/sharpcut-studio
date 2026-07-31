@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from 'react';
-import { CheckCircle2, Download, FileVideo, Loader2, Package, Plus } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { CheckCircle2, Download, FileVideo, ImageDown, Loader2, Package, Plus } from 'lucide-react';
 import { useAppStore } from '../../store/useAppStore';
+import { ThumbnailPreviewCard } from '../studio/ThumbnailPreviewCard';
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return '—';
@@ -15,10 +16,22 @@ export function ExportScreen() {
   const setAppState = useAppStore((s) => s.setAppState);
   const resetProject = useAppStore((s) => s.resetProject);
 
+  // Thumbnail delivery (feature spec point 3) — reads the SAME chosen
+  // thumbnail + current format/crop as the studio screen, rendered through the
+  // same ThumbnailPreviewCard so the downloaded JPEG matches what was shown
+  // there. Pure-frontend canvas work; no ffmpeg involvement.
+  const videoUrl = useAppStore((s) => s.project.videoUrl);
+  const meta = useAppStore((s) => s.project.meta);
+  const format = useAppStore((s) => s.studio.format);
+  const crop = useAppStore((s) => s.studio.crop);
+  const thumbnail = useAppStore((s) => s.studio.thumbnail);
+  const thumbCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
   const [sizes, setSizes] = useState<Record<string, number>>({});
   const [zipping, setZipping] = useState(false);
   const [zipPct, setZipPct] = useState(0);
   const [zipError, setZipError] = useState<string | null>(null);
+  const [thumbError, setThumbError] = useState<string | null>(null);
 
   // Read each blob's size for display (object URLs don't carry it).
   useEffect(() => {
@@ -40,11 +53,13 @@ export function ExportScreen() {
     };
   }, [results]);
 
-  const zipName = useMemo(() => {
+  // Shared base name for every download this screen offers (ZIP + thumbnail).
+  const exportBaseName = useMemo(() => {
     const first = results[0]?.name ?? 'sharpcut';
     const base = first.replace(/-(clip-\d+|sharpcut)\.mp4$/i, '').replace(/\.mp4$/i, '');
-    return `${base || 'sharpcut'}-clips.zip`;
+    return base || 'sharpcut';
   }, [results]);
+  const zipName = useMemo(() => `${exportBaseName}-clips.zip`, [exportBaseName]);
 
   if (results.length === 0) {
     return (
@@ -96,6 +111,33 @@ export function ExportScreen() {
     if (window.confirm('Start a new project? This clears the current video and all edits from this tab.')) {
       resetProject();
     }
+  };
+
+  const downloadThumbnail = () => {
+    setThumbError(null);
+    const canvas = thumbCanvasRef.current;
+    if (!canvas) {
+      setThumbError("Thumbnail isn't ready yet — try again in a moment.");
+      return;
+    }
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) {
+          setThumbError('Could not build the thumbnail image.');
+          return;
+        }
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${exportBaseName}-thumbnail.jpg`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 4000);
+      },
+      'image/jpeg',
+      0.92,
+    );
   };
 
   return (
@@ -159,6 +201,31 @@ export function ExportScreen() {
           </button>
         )}
         {zipError && <p className="mt-2 text-center text-xs text-danger">{zipError}</p>}
+
+        {thumbnail && (
+          <div className="mt-7 border-t border-border pt-6">
+            <p className="mb-3 text-sm font-bold text-ink">Thumbnail</p>
+            <div className="mx-auto max-w-[220px]">
+              <ThumbnailPreviewCard
+                videoUrl={videoUrl}
+                meta={meta}
+                format={format}
+                crop={crop}
+                thumbnail={thumbnail}
+                canvasRef={thumbCanvasRef}
+              />
+            </div>
+            <button
+              type="button"
+              onClick={downloadThumbnail}
+              className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl border border-primary/40 bg-primarySoft px-4 py-2.5 text-sm font-bold text-primary hover:bg-primary/10"
+            >
+              <ImageDown className="h-4 w-4" aria-hidden="true" />
+              Download thumbnail (JPG)
+            </button>
+            {thumbError && <p className="mt-2 text-center text-xs text-danger">{thumbError}</p>}
+          </div>
+        )}
 
         <div className="mt-7 flex flex-col gap-3 border-t border-border pt-6 sm:flex-row">
           <button
