@@ -3,7 +3,11 @@ import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from
 import type { CaptionStyle } from '../../types';
 import {
   applyCase,
+  captionAnchorPct,
   getCaptionRenderSpec,
+  CAPTION_BASE_FRACTION,
+  CAPTION_LEFT_INSET,
+  CAPTION_SAFE_X,
   type CaptionRenderSpec,
 } from '../../lib/captionLayout';
 import {
@@ -50,41 +54,40 @@ function animationCss(spec: CaptionRenderSpec): string | undefined {
   }
 }
 
-/** Vertical anchor (% of frame height) for a caption position. */
-function anchorPct(style: CaptionStyle): number {
-  switch (style.position) {
-    case 'top':
-      return 13;
-    case 'center':
-      return 50;
-    case 'bottom':
-      return 83;
-    case 'custom':
-    default:
-      return Math.min(94, Math.max(6, style.customYPct));
-  }
-}
-
 export function CaptionOverlay({
   cues,
   outputTime,
   style,
-  baseFraction = 0.055,
+  baseFraction = CAPTION_BASE_FRACTION,
   onBlockPointerDown,
 }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const [frameH, setFrameH] = useState(400);
 
+  // Caption size is derived from the frame height, so a stale height silently
+  // renders the whole preview at the wrong scale. Measure BOTH ways: a
+  // ResizeObserver for live resizes, and a direct read after every commit —
+  // ResizeObserver callbacks ride the rendering lifecycle and are not delivered
+  // at all while the tab is hidden or throttled, which would otherwise leave the
+  // overlay stuck on its initial fallback size.
+  const applyFrameH = (h: number | undefined) => {
+    if (h && h > 0) setFrameH((prev) => (Math.abs(prev - h) > 0.5 ? h : prev));
+  };
+
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const ro = new ResizeObserver((entries) => {
-      const h = entries[0]?.contentRect.height;
-      if (h && h > 0) setFrameH(h);
-    });
+    const ro = new ResizeObserver((entries) => applyFrameH(entries[0]?.contentRect.height));
     ro.observe(el);
     return () => ro.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Runs after every commit — cheap, and the only measurement that still works
+  // when the rendering lifecycle (and with it ResizeObserver) is throttled.
+  useLayoutEffect(() => {
+    applyFrameH(ref.current?.getBoundingClientRect().height);
+  });
 
   const baseFontPx = Math.max(10, frameH * baseFraction);
   const spec = useMemo(() => getCaptionRenderSpec(style, baseFontPx), [style, baseFontPx]);
@@ -100,15 +103,17 @@ export function CaptionOverlay({
     style.case === 'original' && spec.preset.uppercaseDefault ? 'upper' : style.case;
 
   const wordIdx = cue ? activeWordIndex(cue, outputTime) : -1;
-  const top = anchorPct(style);
+  // Shared with the ASS export (lib/assSubtitles.ts): the block's CENTRE sits on
+  // this line, and a left-aligned block's LEFT EDGE sits on CAPTION_LEFT_INSET.
+  const top = captionAnchorPct(style);
   const isLeft = spec.align === 'left';
 
   const containerStyle: CSSProperties = {
     position: 'absolute',
-    left: isLeft ? '5%' : '50%',
+    left: isLeft ? `${CAPTION_LEFT_INSET * 100}%` : '50%',
     top: `${top}%`,
     transform: isLeft ? 'translateY(-50%)' : 'translate(-50%, -50%)',
-    maxWidth: '90%',
+    maxWidth: `${(1 - 2 * CAPTION_SAFE_X) * 100}%`,
     display: 'flex',
     flexDirection: 'column',
     alignItems: isLeft ? 'flex-start' : 'center',

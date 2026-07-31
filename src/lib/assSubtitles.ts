@@ -7,6 +7,16 @@
 // so the burned captions match the studio preview. PlayRes matches the export
 // frame so sizes/positions map 1:1.
 //
+// PARITY WITH THE PREVIEW (measured, not assumed — see README "Preview accuracy"):
+//   - POSITION: every Dialogue carries \pos() with a MIDDLE alignment (4/5), so
+//     the block's centre lands on captionAnchorPct(style) — byte-for-byte the
+//     same anchor the overlay uses. No edge-to-margin anchoring anywhere.
+//   - SIZE: ASS Fontsize = cssEmPx * CAPTION_FONTS[font].assLineEm, because
+//     libass fills Fontsize with OS/2 window metrics rather than the em square.
+//   - Every other length (outline, shadow, letter spacing, box padding) is
+//     derived from the CSS em in frame pixels, from constants shared with the
+//     overlay via lib/captionLayout.
+//
 // Per-preset-family approach (documented in the P5 handover):
 //   - box none/bar     -> BorderStyle 1 (outline + soft shadow)
 //   - box block/banner/lowerThird/perWord -> BorderStyle 3 (opaque box drawn in
@@ -20,15 +30,19 @@
 
 import type { CaptionStyle } from '../types';
 import type { CaptionCue } from './captionTiming';
-import { CAPTION_PRESETS, applyCase } from './captionLayout';
+import {
+  CAPTION_BASE_FRACTION,
+  CAPTION_FONTS,
+  CAPTION_LEFT_INSET,
+  CAPTION_OUTLINE_EM,
+  CAPTION_PRESETS,
+  CAPTION_SAFE_X,
+  CAPTION_SHADOW_EM,
+  applyCase,
+  captionAnchorPct,
+  captionBoxHeightEm,
+} from './captionLayout';
 import type { Dims } from './ffmpegFilters';
-
-// Base caption height fraction at 100% — matches CaptionOverlay's baseFraction.
-const BASE_FRACTION = 0.055;
-// Safe horizontal margin (fraction of width) so text never hits the frame edge.
-const SAFE_X = 0.06;
-// Vertical margin (fraction of height) for top/bottom anchored captions.
-const SAFE_V = 0.08;
 
 interface RGBA {
   r: number;
@@ -115,12 +129,17 @@ function fadeInMs(animation: string): number {
   }
 }
 
-/** Numpad alignment: [center|left] x [top|center|bottom]. */
-function alignment(align: 'center' | 'left', pos: CaptionStyle['position']): number {
-  const col = align === 'left' ? 0 : 1; // left -> 1/4/7, center -> 2/5/8
-  if (pos === 'top') return 7 + col;
-  if (pos === 'center' || pos === 'custom') return 4 + col;
-  return 1 + col; // bottom
+/**
+ * Alignment is ALWAYS the middle row (4 = middle-left, 5 = middle-centre) and
+ * every Dialogue carries an explicit `\pos()`. That is what makes the export
+ * match the preview: the preview centres the caption block on
+ * captionAnchorPct(style), so the export has to anchor the same point rather
+ * than pinning a top/bottom EDGE to a margin (which is what alignments 1/2 and
+ * 7/8 do — and why bottom captions used to burn 5-9% of the frame height lower
+ * than the preview showed, worsening as the caption got bigger).
+ */
+function alignment(align: 'center' | 'left'): number {
+  return align === 'left' ? 4 : 5;
 }
 
 /**
@@ -132,9 +151,19 @@ function alignment(align: 'center' | 'left', pos: CaptionStyle['position']): num
  */
 export function buildAss(cues: CaptionCue[], style: CaptionStyle, dims: Dims, assFamily: string): string {
   const preset = CAPTION_PRESETS[style.preset] ?? CAPTION_PRESETS.clean;
+  const fontSpec = CAPTION_FONTS[style.font] ?? CAPTION_FONTS.modern;
   const { w, h } = dims;
 
-  const fontSize = Math.max(10, Math.round(h * BASE_FRACTION * (style.sizePct / 100)));
+  // `emPx` is the caption's CSS em in FRAME pixels — the exact number the
+  // preview overlay uses (frameHeight * CAPTION_BASE_FRACTION * sizePct/100).
+  // Everything measured in pixels below (outline, shadow, letter spacing, box
+  // padding) is expressed against emPx, because ASS lengths are script pixels
+  // and PlayRes == the frame.
+  const emPx = Math.max(8, h * CAPTION_BASE_FRACTION * (style.sizePct / 100));
+  // ...but ASS `Fontsize` is NOT the em: libass fills Fontsize with the face's
+  // OS/2 window metrics, so it must be scaled up by the face's assLineEm or the
+  // burned text comes out 24-43% smaller than the preview (see captionLayout).
+  const fontSize = Math.max(10, Math.round(emPx * fontSpec.assLineEm));
   const effectiveCase: CaptionStyle['case'] =
     style.case === 'original' && preset.uppercaseDefault ? 'upper' : style.case;
 
@@ -155,23 +184,39 @@ export function buildAss(cues: CaptionCue[], style: CaptionStyle, dims: Dims, as
   const secondary = highlight ? textCol : textCol;
 
   // Box presets draw the background via the Outline colour with BorderStyle 3.
+  // libass lays a BorderStyle-3 box out as (line box) + 2 x Outline, and its line
+  // box is exactly `assLineEm` em tall. The preview's box is
+  // CAPTION_LINE_HEIGHT + 2 x padding em tall. Solving the two for equal height
+  // gives the Outline below; when libass' own line box is already taller than the
+  // preview box (faces with generous window metrics, e.g. Poppins) the best
+  // available match is no padding at all, hence the clamp at 0.
+  const boxPadEm = Math.max(
+    0,
+    (captionBoxHeightEm(preset.paddingScale) - fontSpec.assLineEm) / 2,
+  );
   const borderStyle = boxed ? 3 : 1;
   const outlineColour = boxed ? bgCol : outlineCol;
   const outlineW = boxed
-    ? Math.max(2, Math.round(fontSize * 0.2 * (preset.paddingScale || 1)))
+    ? Math.round(emPx * boxPadEm)
     : preset.usesOutline
-      ? Math.max(1, Math.round(fontSize * 0.06))
+      ? Math.max(1, Math.round(emPx * CAPTION_OUTLINE_EM))
       : 0;
-  const shadow = boxed ? 0 : preset.usesOutline ? Math.max(0, Math.round(fontSize * 0.03)) : 0;
+  const shadow = boxed
+    ? 0
+    : preset.usesOutline
+      ? Math.max(0, Math.round(emPx * CAPTION_SHADOW_EM))
+      : 0;
   const backColour = boxed ? bgCol : '&H64000000'; // soft shadow otherwise
 
   const bold = (preset.fontWeight || 700) >= 700 ? -1 : 0;
-  const spacing = Math.round((preset.letterSpacingEm || 0) * fontSize);
-  const align = alignment(preset.align, style.position);
-  const marginL = Math.round(w * SAFE_X);
-  const marginR = Math.round(w * SAFE_X);
-  const marginV =
-    style.position === 'center' || style.position === 'custom' ? 0 : Math.round(h * SAFE_V);
+  const spacing = Math.round((preset.letterSpacingEm || 0) * emPx);
+  const align = alignment(preset.align);
+  // With an explicit \pos on every Dialogue these margins no longer move the
+  // caption; they only bound line wrapping, which WrapStyle 2 already disables.
+  // They are kept so a future multi-line mode still wraps inside the safe area.
+  const marginL = Math.round(w * CAPTION_SAFE_X);
+  const marginR = Math.round(w * CAPTION_SAFE_X);
+  const marginV = 0;
 
   const styleLine = [
     'Style: Default',
@@ -217,10 +262,19 @@ export function buildAss(cues: CaptionCue[], style: CaptionStyle, dims: Dims, as
   ].join('\n');
 
   const fadeMs = fadeInMs(preset.animation);
-  // Position override for custom vertical placement.
-  const customY = style.position === 'custom' ? Math.round((clampPct(style.customYPct) / 100) * h) : null;
-  const posX = preset.align === 'left' ? marginL : Math.round(w / 2);
-  const posOverride = customY != null ? `\\pos(${posX},${customY})` : '';
+  // ONE anchor rule for every position mode, identical to the preview overlay:
+  // the caption block's CENTRE lands on captionAnchorPct(style) of frame height.
+  // Alignment 4/5 makes \pos address the block's middle-left / middle-centre.
+  const posY = Math.round((captionAnchorPct(style) / 100) * h);
+  // A left-aligned block's LEFT EDGE sits on CAPTION_LEFT_INSET, same as the
+  // preview's `left:6%`. For a BorderStyle-3 box libass draws the box `Outline`
+  // px outside the text, so the text anchor shifts right by that much to put the
+  // BOX edge (which is what the eye sees) on the inset.
+  const posX =
+    preset.align === 'left'
+      ? Math.round(w * CAPTION_LEFT_INSET) + (boxed ? outlineW : 0)
+      : Math.round(w / 2);
+  const posOverride = `\\pos(${posX},${posY})`;
 
   const events: string[] = [];
 
@@ -283,8 +337,4 @@ export function buildAss(cues: CaptionCue[], style: CaptionStyle, dims: Dims, as
 
 function dialogue(start: number, end: number, text: string): string {
   return `Dialogue: 0,${assTime(start)},${assTime(end)},Default,,0,0,0,,${text}`;
-}
-
-function clampPct(v: number): number {
-  return Math.min(96, Math.max(4, Number.isFinite(v) ? v : 85));
 }

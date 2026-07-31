@@ -182,6 +182,71 @@ Find the last-known-good deployment and either:
 Nothing is destructive server-side — a rollback only changes which static
 build is served; no user data is stored server-side to migrate or lose.
 
+## Preview accuracy (caption position & size)
+
+**What you see in the studio preview is what gets burned into the MP4.** That is
+now a *measured* guarantee, not a hope.
+
+The preview draws captions with CSS; the export burns them with libass through
+FFmpeg. Two renderers, one contract — held together by `src/lib/captionLayout.ts`,
+which owns every number that decides where a caption sits and how big it is.
+`components/studio/CaptionOverlay.tsx` and `lib/assSubtitles.ts` both read it and
+neither may define its own.
+
+- **Position** — one rule for all four modes: the caption block's **centre**
+  lands on `captionAnchorPct(style)` of frame height (top 13%, centre 50%,
+  bottom 83%, custom = the slider clamped to 6–94%). The export puts every
+  Dialogue line on an explicit `\pos()` with a middle alignment (4/5) so it
+  anchors the same point. It never pins an edge to a margin — doing that is what
+  used to burn bottom captions ~6% of the frame height lower than the preview
+  showed. A left-aligned preset's left **edge** sits on `CAPTION_LEFT_INSET`
+  (6% of frame width) on both sides.
+- **Size** — the caption em is `0.055 x frameHeight x sizePct/100` px on both
+  sides. libass does *not* treat ASS `Fontsize` as that em: it scales the face so
+  the OS/2 `usWinAscent + usWinDescent` fills `Fontsize`. The export therefore
+  multiplies by the face's `assLineEm` (`CAPTION_FONTS[...].assLineEm`, taken
+  from the bundled .ttf's own OS/2 table). Without that factor burned captions
+  come out **24–43% smaller than the preview**, depending on the font — Inter
+  30%, Montserrat 36%, Poppins 43%.
+
+### Tolerances (verified 2026-07-31)
+
+A 12-run matrix — positions {top, centre, bottom, custom 40%} x sizes {65%, 300%}
+for Clean, plus Karaoke 100%, Impact Pop 150%, Brand Banner 100% (left-aligned)
+and one 9:16 run — was exported on a flat-grey fixture and the burned pixels
+measured programmatically against the preview's own DOM geometry. The fixture is
+a solid mid-grey clip, so any non-grey pixel in an exported frame *is* the
+caption; recreate it with:
+
+```bash
+ffmpeg -f lavfi -i color=c=0x808080:s=1280x720:d=20 \
+       -f lavfi -i sine=frequency=440:duration=20 \
+       -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -shortest \
+       testdata/test-gray.mp4
+```
+
+Every row is inside:
+
+| Metric | Tolerance | Worst measured |
+|---|---|---|
+| Caption centre Y (% of frame height) | ± 3 | 0.82 |
+| Caption height (relative) | ± 15% | 11.8% |
+| Caption centre X (% of frame width) | ± 3 | 1.54 |
+
+Known residual approximations, all well inside tolerance:
+
+- The ASS box hugs the text more tightly **horizontally** than the CSS box. ASS
+  `Outline` is a single value used on both axes, and it is solved for *height*
+  parity (box height = line box + 2 x Outline), so the horizontal padding comes
+  out at ~0.15 em instead of the preview's 0.5 em.
+- libass advance widths run ~3% narrower than the browser's for the same face and
+  size, so a burned line is marginally shorter than the previewed one. Line
+  breaking is unaffected: word grouping is measured with the browser's metrics,
+  so the export can only ever be *narrower* than what was fitted.
+- A caption large enough to overflow the frame (e.g. 300% anchored at the top)
+  is clipped by the frame on both sides, but the preview's measured box still
+  reports its unclipped height.
+
 ## Known limitations
 
 - **Practical length ceiling:** a 30-minute / 573 MB / 116-segment combined
@@ -352,6 +417,8 @@ plus local FFmpeg CLI cross-checks where noted.
 |---|---|
 | 9:16 preview | PASS — true-crop box |
 | Caption single-line scaling 50–300% | PASS — preview and burned ASS agree |
+| Caption position + size parity (measured) | PASS — 12-export matrix on a flat-grey fixture; burned pixels measured against preview DOM geometry; worst deltas 0.82% frame height (centre Y), 11.8% (height), 1.54% frame width (centre X). See "Preview accuracy" |
+| Caption text edits reach the export | PASS — two blocks retyped in the editor, burned verbatim at 65% / custom 85% / Karaoke on `test-speech-30s.mp4`; ALL CAPS toggle and a `#00FF00` karaoke accent both confirmed by pixel check (fill centre 84.93% vs preview 85.00%) |
 | Punch-zoom 1.4× tight crop | PASS — CLI SSIM frame comparison **and** completed in-app export (1080×1922, 30.1s, karaoke burned) |
 | Resume gating | PASS — resumes only on explicit click (80s idle test) |
 | Title-bar progress | PASS — `▶ NN% — SharpCut export` while backgrounded |
