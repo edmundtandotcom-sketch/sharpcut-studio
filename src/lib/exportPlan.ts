@@ -35,6 +35,7 @@ import { fontAssetFor, type FontAsset } from './captionFonts';
 import {
   encodeArgs,
   outputDims,
+  r,
   segmentAudioFilter,
   segmentVideoFilter,
   videoEncodeArgs,
@@ -327,6 +328,44 @@ export function buildExportPlan(input: BuildPlanInput): ExportPlan {
     hasTransitions,
     outputName: `${input.baseName}-sharpcut.mp4`,
   };
+}
+
+/**
+ * argv for ONE segment / clip render — the single source of truth for that
+ * command. The wasm worker executes what this returns, and the native bridge
+ * (BACKDROP/backdrop/sharpcut_export.py::_segment_args) mirrors it argument for
+ * argument; keep the two in lockstep.
+ *
+ * ORDERING IS LOAD-BEARING: `-ss` AND `-t` are both INPUT options and must both
+ * sit BEFORE `-i`. `spec.srcDuration` is a SOURCE-side window ("read this many
+ * seconds starting at srcStart"), and only pre-`-i` does FFmpeg read it that
+ * way. Placed after `-i`, `-t` caps the OUTPUT duration instead — silently
+ * correct at speed == 1 (setpts is identity, so in == out) and wrong at every
+ * other speed. At 1.5x the render kept going until it had EMITTED srcDuration
+ * seconds, so it consumed 1.5x the intended source and came out 1.5x too long,
+ * while `spec.outDuration` (srcDuration / speed) — which drives the xfade
+ * offsets in the join — still described the correct, shorter segment. Result:
+ * over-long segments, transitions landing in the wrong place, and a container
+ * padded past its own video stream.
+ *
+ * Pre-input `-ss` keeps cuts frame-accurate here: FFmpeg seeks to the preceding
+ * keyframe and then decodes-and-discards to the exact timestamp, and every
+ * segment is re-encoded, so there is no keyframe-snapping penalty.
+ */
+export function segmentRenderArgs(spec: SegmentSpec, plan: ExportPlan): string[] {
+  const args = [
+    '-ss', String(r(spec.srcStart)),
+    '-t', String(r(spec.srcDuration)),
+    '-i', 'input',
+    '-vf', spec.vf,
+  ];
+  if (plan.hasAudio) {
+    args.push('-af', spec.af, ...plan.segmentEncode);
+  } else {
+    args.push('-an', ...plan.segmentVideoEncode, '-movflags', '+faststart');
+  }
+  args.push(spec.outName);
+  return args;
 }
 
 /** Strip a file extension for use as the export base name. */

@@ -23,6 +23,7 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile } from '@ffmpeg/util';
 import { r } from '../lib/ffmpegFilters';
+import { segmentRenderArgs } from '../lib/exportPlan';
 import type {
   ClipsPlan,
   CombinedPlan,
@@ -371,16 +372,9 @@ async function writeSegmentAss(spec: SegmentSpec): Promise<void> {
   if (spec.ass && spec.assName) await writeText(spec.assName, spec.ass);
 }
 
-function segmentRenderArgs(spec: SegmentSpec, plan: ExportPlan): string[] {
-  const args = ['-ss', String(r(spec.srcStart)), '-i', 'input', '-t', String(r(spec.srcDuration)), '-vf', spec.vf];
-  if (plan.hasAudio) {
-    args.push('-af', spec.af, ...plan.segmentEncode);
-  } else {
-    args.push('-an', ...plan.segmentVideoEncode, '-movflags', '+faststart');
-  }
-  args.push(spec.outName);
-  return args;
-}
+// segmentRenderArgs lives in lib/exportPlan.ts (imported above): the plan owns
+// the argv so the wasm worker and the native bridge cannot drift apart. See the
+// note there on why `-ss` and `-t` must BOTH precede `-i`.
 
 /**
  * concat-demuxer stream copy of `files` into `out`, as one progress step.
