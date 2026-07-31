@@ -9,13 +9,29 @@ interface Props {
   onCancel: () => void;
   onRetry: () => void;
   onClose: () => void;
+  /**
+   * Local Studio shell only: offered when the NATIVE export engine failed, so
+   * the user can re-run the identical plan on the in-browser engine instead.
+   * Undefined everywhere else (including the deployed build), where the failure
+   * card keeps its original two buttons.
+   */
+  onUseBrowserEngine?: () => void;
 }
 
 /**
  * Full-screen export overlay (SPEC "Export progress"): current stage, real %,
  * elapsed time, cancel, a do-not-close warning, and a failure card with retry.
  */
-export function ExportProgress({ stage, pct, elapsedS, error, onCancel, onRetry, onClose }: Props) {
+export function ExportProgress({
+  stage,
+  pct,
+  elapsedS,
+  error,
+  onCancel,
+  onRetry,
+  onClose,
+  onUseBrowserEngine,
+}: Props) {
   const clamped = Math.max(0, Math.min(100, pct));
 
   return (
@@ -54,6 +70,15 @@ export function ExportProgress({ stage, pct, elapsedS, error, onCancel, onRetry,
                 Retry export
               </button>
             </div>
+            {onUseBrowserEngine && (
+              <button
+                type="button"
+                onClick={onUseBrowserEngine}
+                className="mt-3 w-full rounded-xl border border-border px-4 py-2.5 text-sm font-semibold text-ink hover:bg-bg"
+              >
+                Retry in browser engine (slower, always works)
+              </button>
+            )}
           </>
         ) : (
           <>

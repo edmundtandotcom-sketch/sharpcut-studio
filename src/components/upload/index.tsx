@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Film,
@@ -12,6 +12,7 @@ import type { DragEvent } from 'react';
 import { useAppStore } from '../../store/useAppStore';
 import type { PacingPreset } from '../../types';
 import { ACCEPT_ATTR, validateVideoFile } from './validation';
+import { fetchBackdropRender, isLocalShell } from '../../lib/localBridge';
 import { ProjectRecoveryPanel } from './ProjectRecoveryPanel';
 
 type Phase = 'idle' | 'checking' | 'error';
@@ -79,6 +80,34 @@ export function UploadScreen() {
     },
     [setAppState, setProjectFile, setProjectMeta],
   );
+
+  // ---- Studio handoff: /sharpcut/?src=<backdrop job id> --------------------
+  // LOCAL SHELL ONLY (the deployed build's origin fails isLocalShell(), so this
+  // effect is inert there). Pulls the finished Backdrop render off the local
+  // server and pushes it through handleFile — the exact same path as a file the
+  // user picked, validation and all.
+  const handoffRef = useRef(false);
+  useEffect(() => {
+    if (handoffRef.current) return;
+    if (!isLocalShell()) return;
+    const src = new URLSearchParams(window.location.search).get('src');
+    if (!src) return;
+    handoffRef.current = true;
+    // Drop the param so a reload doesn't re-import the same render.
+    window.history.replaceState({}, '', window.location.pathname);
+    setPhase('checking');
+    void (async () => {
+      try {
+        await handleFile(await fetchBackdropRender(src));
+      } catch (err) {
+        setErrorMsg({
+          error: err instanceof Error ? err.message : 'Could not load that render.',
+          recovery: 'Choose the video file manually, or run the background render again.',
+        });
+        setPhase('error');
+      }
+    })();
+  }, [handleFile]);
 
   const onInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];

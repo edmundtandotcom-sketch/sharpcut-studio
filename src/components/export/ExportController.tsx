@@ -7,6 +7,7 @@ import {
   type ExportHandle,
   type ExportResultFile,
 } from '../../lib/exportEngine';
+import { bridgeAvailable, startBridgeExport } from '../../lib/localBridge';
 import { ExportProgress } from './ExportProgress';
 
 /** Pull just the StudioSettings fields out of the (action-augmented) slice. */
@@ -45,6 +46,11 @@ export function ExportController() {
   const [running, setRunning] = useState(false);
   const startRef = useRef(0);
   const handleRef = useRef<ExportHandle | null>(null);
+  // Local Studio shell only. `forceBrowser` is set by the "Retry in browser
+  // engine" escape hatch; `usedBridge` records which engine the failed run used
+  // so that button is only offered when it is actually the fix.
+  const forceBrowserRef = useRef(false);
+  const [usedBridge, setUsedBridge] = useState(false);
 
   const finishWithResults = useCallback(
     (files: ExportResultFile[]) => {
@@ -58,12 +64,15 @@ export function ExportController() {
       setExportResults(urls);
       setRunning(false);
       setExportProgress(null);
+      // A success clears the browser-engine override, so the next export gets
+      // the fast path again rather than being stuck on the fallback for the tab.
+      forceBrowserRef.current = false;
       setAppState('complete');
     },
     [setExportResults, setExportProgress, setAppState],
   );
 
-  const beginExport = useCallback(() => {
+  const beginExport = useCallback(async () => {
     const st = useAppStore.getState();
     const file = st.project.file;
     const meta = st.project.meta;
@@ -80,8 +89,18 @@ export function ExportController() {
       studio,
     };
 
-    const risk = memoryRisk(file, studio.mode);
-    if (risk && !window.confirm(risk)) return; // user declined the large export
+    // Native export bridge (local Studio shell only). The plan is built the same
+    // way either way; the bridge just runs it on the native ffmpeg binary, which
+    // is 10-30x faster than ffmpeg.wasm. bridgeAvailable() is false on the
+    // deployed site by construction — the origin check fails before any request.
+    const useBridge = !forceBrowserRef.current && (await bridgeAvailable());
+
+    // wasm's ~2 GB address space is the only reason this warning exists; the
+    // native engine has no such ceiling, so don't nag when it is doing the work.
+    if (!useBridge) {
+      const risk = memoryRisk(file, studio.mode);
+      if (risk && !window.confirm(risk)) return; // user declined the large export
+    }
 
     // Clear any previous run's output before starting.
     for (const r of st.exportJob.resultUrls) URL.revokeObjectURL(r.url);
@@ -90,9 +109,11 @@ export function ExportController() {
 
     startRef.current = Date.now();
     setRunning(true);
+    setUsedBridge(useBridge);
     setExportProgress({ stage: 'Preparing', pct: 0, elapsedS: 0 });
 
-    handleRef.current = startExport(deps, {
+    const run = useBridge ? startBridgeExport : startExport;
+    handleRef.current = run(deps, {
       onProgress: (stage, pct) =>
         setExportProgress({ stage, pct, elapsedS: (Date.now() - startRef.current) / 1000 }),
       onResult: (files) => finishWithResults(files),
@@ -112,7 +133,7 @@ export function ExportController() {
   useEffect(() => {
     if (!requested) return;
     clearExportRequest();
-    beginExport();
+    void beginExport();
   }, [requested, clearExportRequest, beginExport]);
 
   // Keep the elapsed clock moving between worker progress events.
@@ -160,6 +181,15 @@ export function ExportController() {
         setExportError(null);
         requestExport();
       }}
+      onUseBrowserEngine={
+        usedBridge
+          ? () => {
+              forceBrowserRef.current = true;
+              setExportError(null);
+              requestExport();
+            }
+          : undefined
+      }
       onClose={() => {
         setExportError(null);
         setExportProgress(null);

@@ -128,6 +128,76 @@ The Whisper model itself is **not** part of `dist/` — it's fetched from the
 Hugging Face CDN on first use and cached by the browser (see
 [Privacy](#privacy)).
 
+## Local Studio shell + native export bridge
+
+SharpCut also ships as **step 2 of a single local app** on the owner's PC:
+Backdrop Studio (`E:\BACKDROP`) serves this build at `/sharpcut/` alongside its
+own background-replacement UI, so the flow is *1 Background → 2 Edit & Export*
+in one browser tab. **This changes nothing about the deployed site** — every
+line of it is gated on the page being served from an `http://` loopback origin
+(`lib/localBridge.ts`, `isLocalShell()`), which the Cloudflare origin can never
+satisfy.
+
+### Building for the sub-path
+
+```bash
+npm run build:local     # vite build --base=/sharpcut/ --outDir dist-local
+```
+
+A separate build with a separate output is required: the cloud bundle hard-codes
+`/assets/...` in `index.html`, which 404s under `/sharpcut/`. Cloud `dist/` is
+never touched. In practice you don't run this by hand — Backdrop's
+`tools/sync-sharpcut.ps1` runs it and mirrors `dist-local/` into that server's
+`sharpcut-dist/`. **SharpCut changes are not live in the local shell until that
+script is re-run.**
+
+Everything except `index.html` follows the base automatically (worker chunks and
+the split `ffmpeg-core.wasm.part*` resolve off `import.meta.url`; caption fonts
+off `import.meta.env.BASE_URL`) — verified loading in the browser under the
+sub-path, with `crossOriginIsolated === true` from headers the local server
+sets.
+
+### Native export bridge
+
+Under the local shell an export is routed to the native FFmpeg 8.1.2 binary
+instead of `ffmpeg.wasm`. The plan is built by the **same** `buildPlanFor()` —
+same `-vf`/`-af` strings, same per-segment ASS files, same encode args — and
+POSTed as JSON (plus the source file, or a reference to a Backdrop render
+already on the server's disk) to `POST /api/sharpcut/export`. Progress polls the
+server's job state into the unchanged progress UI, and the finished file lands
+on the unchanged complete screen. If the bridge fails for any reason the failure
+card offers **"Retry in browser engine"**, which runs the existing wasm path
+unchanged.
+
+**Measured A/B** (2026-07-31) — same source, same cuts, same settings:
+`testdata/vertical-60s.mkv`, 1080×1920 → Vertical 9:16, Karaoke captions,
+3 suggested + 1 manual cut → 5 segments, High quality, 51 s output. The wasm
+side was run against the deployed `dist/` served by `npm run preview`, i.e. the
+unmodified cloud build:
+
+| Engine | Wall clock | Output |
+|---|---|---|
+| Browser `ffmpeg.wasm` (single-thread) | **259.1 s** (4 m 19 s) | 29,093,581 B · 51.055 s |
+| **Native bridge** | **12.0 s** (repeat: 13.2 s) | 29,262,471 B · 50.953 s |
+
+**~21× faster.** The outputs differ by 0.58 % in size and 0.10 s (3 frames) in
+duration — the expected gap between identical x264 arguments on a wasm build vs
+a native one, not a different edit.
+
+Two behaviours worth carrying into any future work on `lib/exportPlan.ts`:
+
+- **`-t` is an OUTPUT cap.** The plan emits `-ss <start> -i input -t
+  <srcDuration>`, and because `-t` sits after `-i` FFmpeg reads it as an output
+  duration limit. At `speed != 1` a segment therefore renders `srcDuration` long
+  having consumed `speed × srcDuration` of source, and `outDuration`
+  (`srcDuration / speed`) — which feeds the xfade offsets — is wrong. Measured
+  on a real 1.5× plan: segments of 8.0/9.0/14.0 s where the plan predicted
+  5.33/6.0/9.33 s, and with a transition the joined video stream came out
+  27.93 s inside a 30.66 s container. Both engines execute the identical argv
+  and produce the identical file, so this is not a bridge behaviour.
+- The bridge deliberately does **not** correct it: it is a faster executor of
+  the plan, not a second editor. The fix belongs here, once, for both engines.
+
 ## Deployment (Cloudflare Pages)
 
 Cloudflare Pages was chosen over Vercel/Netlify for this project because it
