@@ -72,6 +72,11 @@ interface ExportJobSlice {
   // P4->P5 export seam: the Studio Export button flips `requested` true.
   // P5 (FFmpeg engine) observes this flag to start the real export job.
   requested: boolean;
+  // True for as long as an export job is actually executing. `requested` is
+  // consumed the instant the engine starts, so it cannot answer "is an export
+  // running right now?" — which anything that might navigate away has to know
+  // (see components/shared/StudioBackBar).
+  running: boolean;
 }
 
 // Caption text-editor undo/redo history (snapshots of analysis.captionBlocks).
@@ -111,6 +116,8 @@ export interface AppStore {
   setExportProgress: (progress: ExportProgress | null) => void;
   setExportResults: (results: { name: string; url: string }[]) => void;
   setExportError: (error: string | null) => void;
+  /** Flipped by the export controller around the actual job execution. */
+  setExportRunning: (running: boolean) => void;
   /** P4->P5 export seam. Studio Export button calls this; P5 engine reacts. */
   requestExport: () => void;
   clearExportRequest: () => void;
@@ -147,6 +154,7 @@ const initialExportJob: ExportJobSlice = {
   resultUrls: [],
   error: null,
   requested: false,
+  running: false,
 };
 
 const initialCaptionEditor: CaptionEditorSlice = { past: [], future: [] };
@@ -318,6 +326,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   setExportResults: (resultUrls) =>
     set((s) => ({ exportJob: { ...s.exportJob, resultUrls } })),
   setExportError: (error) => set((s) => ({ exportJob: { ...s.exportJob, error } })),
+  setExportRunning: (running) => set((s) => ({ exportJob: { ...s.exportJob, running } })),
   requestExport: () =>
     set((s) => ({ exportJob: { ...s.exportJob, requested: true, error: null } })),
   clearExportRequest: () =>

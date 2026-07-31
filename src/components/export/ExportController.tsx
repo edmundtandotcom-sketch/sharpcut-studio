@@ -43,7 +43,12 @@ export function ExportController() {
   const requestExport = useAppStore((s) => s.requestExport);
   const setAppState = useAppStore((s) => s.setAppState);
 
-  const [running, setRunning] = useState(false);
+  // Store-backed rather than component-local: anything that could navigate
+  // away from this page (the back-to-Backdrop bar in the local Studio shell)
+  // has to be able to see that an export is in flight, and `requested` is
+  // consumed the instant the engine starts.
+  const running = useAppStore((s) => s.exportJob.running);
+  const setRunning = useAppStore((s) => s.setExportRunning);
   const startRef = useRef(0);
   const handleRef = useRef<ExportHandle | null>(null);
   // Local Studio shell only. `forceBrowser` is set by the "Retry in browser

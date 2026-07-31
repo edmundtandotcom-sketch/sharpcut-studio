@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
+  Download,
   Film,
   Loader2,
   Lock,
@@ -12,7 +13,7 @@ import type { DragEvent } from 'react';
 import { useAppStore } from '../../store/useAppStore';
 import type { PacingPreset } from '../../types';
 import { ACCEPT_ATTR, validateVideoFile } from './validation';
-import { fetchBackdropRender, isLocalShell } from '../../lib/localBridge';
+import { fetchBackdropRender, isLocalShell, type HandoffProgress } from '../../lib/localBridge';
 import { ProjectRecoveryPanel } from './ProjectRecoveryPanel';
 
 type Phase = 'idle' | 'checking' | 'error';
@@ -50,6 +51,13 @@ export function UploadScreen() {
   const [errorMsg, setErrorMsg] = useState<{ error: string; recovery: string } | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [recovering, setRecovering] = useState(false);
+  // ?src= handoff: bytes in flight, and (separately from the generic upload
+  // error) the reason the handoff itself failed. Both are surfaced ABOVE the
+  // hero rather than under the drop zone — the previous version put the only
+  // evidence of a failed handoff below the fold, under a resume card, which
+  // reads as "it just did nothing".
+  const [handoff, setHandoff] = useState<HandoffProgress | null>(null);
+  const [handoffError, setHandoffError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const handleFile = useCallback(
@@ -96,15 +104,19 @@ export function UploadScreen() {
     // Drop the param so a reload doesn't re-import the same render.
     window.history.replaceState({}, '', window.location.pathname);
     setPhase('checking');
+    setHandoffError(null);
+    setHandoff({ loaded: 0, total: null });
     void (async () => {
       try {
-        await handleFile(await fetchBackdropRender(src));
+        const file = await fetchBackdropRender(src, setHandoff);
+        setHandoff(null);
+        await handleFile(file);
       } catch (err) {
-        setErrorMsg({
-          error: err instanceof Error ? err.message : 'Could not load that render.',
-          recovery: 'Choose the video file manually, or run the background render again.',
-        });
-        setPhase('error');
+        setHandoff(null);
+        setHandoffError(
+          err instanceof Error ? err.message : 'Could not load that render.',
+        );
+        setPhase('idle');
       }
     })();
   }, [handleFile]);
@@ -134,8 +146,71 @@ export function UploadScreen() {
 
   const checking = phase === 'checking';
 
+  const mb = (n: number) => (n / (1024 * 1024)).toFixed(1);
+
   return (
     <div className="mx-auto max-w-4xl px-6 py-12 sm:py-16">
+      {/* ---- Studio handoff status. Deliberately the FIRST thing on the page:
+       * when step 1 hands a render to step 2, that transfer is the only thing
+       * happening, and if it fails it is the only thing worth reading. ---- */}
+      {handoff && (
+        <div
+          role="status"
+          className="mb-8 rounded-xl border border-primary/30 bg-primarySoft px-4 py-3"
+        >
+          <div className="flex items-center gap-3">
+            <Download className="h-4 w-4 shrink-0 animate-pulse text-primary" aria-hidden="true" />
+            <p className="text-sm font-semibold text-ink">
+              Bringing your background render across&hellip;
+            </p>
+            <p className="ml-auto text-sm font-medium tabular-nums text-muted">
+              {handoff.total
+                ? `${mb(handoff.loaded)} / ${mb(handoff.total)} MB`
+                : `${mb(handoff.loaded)} MB`}
+            </p>
+          </div>
+          <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-border">
+            <div
+              className="h-full rounded-full bg-primary transition-[width] duration-150"
+              style={{
+                width: handoff.total
+                  ? `${Math.min(100, (handoff.loaded / handoff.total) * 100)}%`
+                  : '100%',
+              }}
+            />
+          </div>
+          <p className="mt-1.5 text-xs text-muted">
+            Copying it from the background studio on this machine. Nothing is uploaded.
+          </p>
+        </div>
+      )}
+
+      {handoffError && (
+        <div
+          role="alert"
+          className="mb-8 flex items-start gap-3 rounded-xl border border-danger/40 bg-danger/5 px-4 py-3"
+        >
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-danger" aria-hidden="true" />
+          <div className="text-sm">
+            <p className="font-semibold text-ink">
+              Couldn&rsquo;t bring the background render across.
+            </p>
+            <p className="mt-0.5 text-muted">{handoffError}</p>
+            <p className="mt-1 text-muted">
+              Choose the finished video below instead &mdash; it is in the background
+              studio&rsquo;s output folder &mdash; or run the render again.
+            </p>
+            <button
+              type="button"
+              onClick={() => setHandoffError(null)}
+              className="mt-2 text-sm font-semibold text-primary hover:underline"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Hero */}
       <div className="text-center">
         <h1 className="text-4xl font-black tracking-tight text-ink sm:text-5xl">

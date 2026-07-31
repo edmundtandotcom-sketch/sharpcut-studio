@@ -4,6 +4,7 @@ import { useAppStore } from './store/useAppStore';
 import { checkFeatures } from './lib/featureCheck';
 import { Header } from './components/shared/Header';
 import { ErrorBoundary } from './components/shared/ErrorBoundary';
+import { StudioBackBar } from './components/shared/StudioBackBar';
 import { PersistenceController } from './components/shared/PersistenceController';
 import { UploadScreen } from './components/upload';
 import { AnalysisScreen } from './components/analysis';
@@ -42,6 +43,8 @@ function App() {
         Skip to content
       </a>
 
+      {/* Local Studio shell only — renders nothing on the deployed site. */}
+      <StudioBackBar />
       <Header />
       {!features.supported && <UnsupportedBrowserBanner reasons={features.reasons} />}
 
