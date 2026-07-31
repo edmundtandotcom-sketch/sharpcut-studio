@@ -264,6 +264,9 @@ export function UploadScreen() {
           })}
         </div>
       </div>
+
+      {/* Build stamp — makes a stale cached tab obvious without opening devtools. */}
+      <p className="mt-10 text-center text-[10px] text-muted">build {__BUILD_TS__}</p>
     </div>
   );
 }

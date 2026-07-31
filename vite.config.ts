@@ -4,6 +4,11 @@ import react from '@vitejs/plugin-react';
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [react()],
+  // Stamped into the bundle at build time so a stale browser tab is diagnosable
+  // at a glance (shown in the upload screen footer + logged on boot).
+  define: {
+    __BUILD_TS__: JSON.stringify(new Date().toISOString()),
+  },
   server: {
     headers: {
       'Cross-Origin-Opener-Policy': 'same-origin',
