@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { CheckCircle2, Download, FileVideo, ImageDown, Loader2, Package, Plus } from 'lucide-react';
 import { useAppStore } from '../../store/useAppStore';
 import { ThumbnailPreviewCard } from '../studio/ThumbnailPreviewCard';
+import { canPickDestination, saveBlobAs, saveUrlAs } from '../../lib/saveFile';
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return '—';
@@ -32,6 +33,7 @@ export function ExportScreen() {
   const [zipPct, setZipPct] = useState(0);
   const [zipError, setZipError] = useState<string | null>(null);
   const [thumbError, setThumbError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   // Read each blob's size for display (object URLs don't carry it).
   useEffect(() => {
@@ -91,15 +93,7 @@ export function ExportScreen() {
         zip.file(r.name, blob);
       }
       const out = await zip.generateAsync({ type: 'blob' }, (meta) => setZipPct(meta.percent));
-      const url = URL.createObjectURL(out);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = zipName;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      // Revoke shortly after the download starts.
-      setTimeout(() => URL.revokeObjectURL(url), 4000);
+      await saveBlobAs(out, zipName, 'application/zip', 'ZIP archive');
     } catch (err) {
       setZipError(err instanceof Error ? err.message : 'Could not build the ZIP.');
     } finally {
@@ -126,14 +120,14 @@ export function ExportScreen() {
           setThumbError('Could not build the thumbnail image.');
           return;
         }
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `${exportBaseName}-thumbnail.jpg`;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 4000);
+        void saveBlobAs(
+          blob,
+          `${exportBaseName}-thumbnail.jpg`,
+          'image/jpeg',
+          'JPEG image',
+        ).catch((err) =>
+          setThumbError(err instanceof Error ? err.message : 'Could not save the thumbnail.'),
+        );
       },
       'image/jpeg',
       0.92,
@@ -168,9 +162,21 @@ export function ExportScreen() {
                 <p className="truncate text-sm font-semibold text-ink">{r.name}</p>
                 <p className="text-xs tabular-nums text-muted">{formatBytes(sizes[r.url])}</p>
               </div>
+              {/* Still an anchor, so the fallback is the browser's own
+                  download and needs no code of its own. Where the File System
+                  Access API exists the click is intercepted and the user picks
+                  a destination; a failure there re-arms the anchor rather than
+                  leaving them with no way to get the file. */}
               <a
                 href={r.url}
                 download={r.name}
+                onClick={(e) => {
+                  if (!canPickDestination()) return;   // native download, untouched
+                  e.preventDefault();
+                  void saveUrlAs(r.url, r.name, 'video/mp4', 'MP4 video').catch((err) =>
+                    setSaveError(err instanceof Error ? err.message : 'Could not save the file.'),
+                  );
+                }}
                 className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-xs font-bold text-white hover:bg-primary/90"
               >
                 <Download className="h-3.5 w-3.5" aria-hidden="true" />
@@ -179,6 +185,7 @@ export function ExportScreen() {
             </li>
           ))}
         </ul>
+        {saveError && <p className="mt-2 text-center text-xs text-danger">{saveError}</p>}
 
         {results.length > 1 && (
           <button
